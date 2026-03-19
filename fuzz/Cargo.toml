@@ -1,0 +1,52 @@
+[package]
+name = "aether-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+aether-core = { path = "../aether-core", features = ["enterprise"] }
+tempfile = "3"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_block_header"
+path = "fuzz_targets/fuzz_block_header.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_streaming_metadata"
+path = "fuzz_targets/fuzz_streaming_metadata.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_block"
+path = "fuzz_targets/fuzz_decode_block.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_range_coder"
+path = "fuzz_targets/fuzz_range_coder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decompress_pipeline"
+path = "fuzz_targets/fuzz_decompress_pipeline.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_path_validation"
+path = "fuzz_targets/fuzz_path_validation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_encryption_header"
+path = "fuzz_targets/fuzz_encryption_header.rs"
+doc = false

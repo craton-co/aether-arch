@@ -1,0 +1,27 @@
+[package]
+name = "aether-ffi"
+version = "0.2.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C FFI bindings for AetherArch compression library"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+aether-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[features]
+default = ["context-mixer"]
+context-mixer = ["aether-core/context-mixer"]
+
+[package.metadata.docs.rs]
+all-features = true

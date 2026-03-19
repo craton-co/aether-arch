@@ -1,0 +1,29 @@
+{
+  "name": "AetherArch",
+  "version": "0.1.0",
+  "description": "Next-generation file archiver",
+  "authors": ["Anonymous"],
+  "features": [
+    "neural-probabilistic prediction",
+    "context-mixing compression",
+    "content-defined chunking",
+    "semantic solid archiving",
+    "adaptive entropy routing",
+    "range coding via constriction",
+    "zstandard fallback",
+    "BLAKE3 integrity checksums"
+  ],
+  "benchmarks": {
+    "english_text_bpb": 2.5,
+    "source_code_bpb": 3.0,
+    "binary_data_bpb": 6.5,
+    "random_data_bpb": 8.0
+  },
+  "config": {
+    "min_chunk_size": 4096,
+    "avg_chunk_size": 65536,
+    "max_chunk_size": 524288,
+    "high_entropy_threshold": 7.5,
+    "incompressible_threshold": 7.95
+  }
+}

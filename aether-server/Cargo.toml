@@ -1,0 +1,31 @@
+[package]
+name = "aether-server"
+version = "0.2.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AetherArch compression REST API server"
+
+[dependencies]
+aether-core = { workspace = true }
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["limit", "cors", "set-header", "trace"] }
+serde = { workspace = true }
+serde_json = "1"
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = "3"
+governor = "0.10"
+tower_governor = "0.8"
+subtle = "2"
+blake3 = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,0 +1,26 @@
+[package]
+name = "aether-cli"
+version = "0.2.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AetherArch CLI — next-generation file archiver"
+
+[[bin]]
+name = "aet"
+path = "src/main.rs"
+
+[features]
+enterprise = ["aether-core/enterprise"]
+
+[dependencies]
+aether-core = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+humansize = { workspace = true }
+rpassword = "7"
+zeroize = { version = "1", features = ["derive"] }
+
+[package.metadata.docs.rs]
+all-features = true

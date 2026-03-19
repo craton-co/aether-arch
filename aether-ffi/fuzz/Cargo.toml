@@ -1,0 +1,27 @@
+[package]
+name = "aether-ffi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+aether-ffi = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "fuzz_extract"
+path = "fuzz_targets/fuzz_extract.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_list"
+path = "fuzz_targets/fuzz_list.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_cstr"
+path = "fuzz_targets/fuzz_cstr.rs"
+doc = false

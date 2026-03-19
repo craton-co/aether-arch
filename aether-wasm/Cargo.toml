@@ -1,0 +1,18 @@
+[package]
+name = "aether-wasm"
+version = "0.2.3"
+edition.workspace = true
+description = "WebAssembly bindings for AetherArch decompression"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aether-core = { path = "../aether-core", default-features = false }
+wasm-bindgen = "0.2.112"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package.metadata.docs.rs]
+all-features = true

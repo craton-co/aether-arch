@@ -1,0 +1,13 @@
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.
+AetherArch is a next-generation file archiver with neural-probabilistic compression.
+It uses content-defined chunking, adaptive entropy routing, and context-mixing prediction.
+Structured data like text and source code compresses exceptionally well because the
+predictor learns the statistical patterns of the input and feeds probabilities to a
+range coder, which encodes bytes using fractions of a bit when prediction confidence
+is high. This paragraph repeats key phrases to give the predictor material to learn:
+neural-probabilistic compression, context-mixing prediction, adaptive entropy routing,
+content-defined chunking, range coding, AetherArch, file archiver.

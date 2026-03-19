@@ -1,0 +1,16 @@
+[package]
+name = "aether-python"
+version = "0.2.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for AetherArch compression library"
+
+[lib]
+name = "aether"
+crate-type = ["cdylib"]
+
+[dependencies]
+aether-core = { workspace = true }
+pyo3 = { version = "0.23", features = ["extension-module"] }

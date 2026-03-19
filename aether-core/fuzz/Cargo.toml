@@ -1,0 +1,49 @@
+[package]
+name = "aether-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.aether-core]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_lz77_decode"
+path = "fuzz_targets/fuzz_lz77_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_rle_decode"
+path = "fuzz_targets/fuzz_rle_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bwt_mtf_decode"
+path = "fuzz_targets/fuzz_bwt_mtf_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_range_decode"
+path = "fuzz_targets/fuzz_range_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_zstd_decompress"
+path = "fuzz_targets/fuzz_zstd_decompress.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_archive_decompress"
+path = "fuzz_targets/fuzz_archive_decompress.rs"
+doc = false

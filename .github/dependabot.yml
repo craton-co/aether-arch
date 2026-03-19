@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Disable auto-PRs for Cargo deps (too noisy with breaking major bumps).
+    # Dependabot security alerts still work regardless of this setting.
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+    ignore:
+      # Pinned for format stability — do not auto-upgrade
+      - dependency-name: "lz4_flex"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    ignore:
+      # MSRV is pinned intentionally — do not auto-upgrade
+      - dependency-name: "dtolnay/rust-toolchain"

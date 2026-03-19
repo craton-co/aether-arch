@@ -1,0 +1,42 @@
+AetherArch
+Copyright 2024-2026 Craton Software Company
+
+This product includes software developed by Craton Software Company
+(https://craton.com.ar)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+This product depends on the following third-party crates (non-exhaustive):
+
+  fastcdc (MIT/Apache-2.0)   — Content-defined chunking
+  zstd (MIT)                 — Zstandard compression (binding to C library)
+  blake3 (CC0-1.0/Apache-2.0)— BLAKE3 hash function
+  lz4_flex (MIT)             — Pure-Rust LZ4 compression
+  divsufsort (MIT)           — Pure-Rust suffix array construction
+  byteorder (MIT/Unlicense)  — Little-endian serialization
+  thiserror (MIT/Apache-2.0) — Error type derivation
+  clap (MIT/Apache-2.0)      — CLI argument parsing
+  rayon (MIT/Apache-2.0)     — Data parallelism
+  crc32fast (MIT/Apache-2.0) — CRC32 checksums
+  serde (MIT/Apache-2.0)     — Serialization framework
+  tracing (MIT)              — Structured logging
+  axum (MIT)                 — HTTP server framework (aether-server)
+  tokio (MIT)                — Async runtime (aether-server)
+  aes-gcm (MIT/Apache-2.0)   — AES-256-GCM encryption
+  chacha20poly1305 (MIT/Apache-2.0) — ChaCha20-Poly1305 encryption
+  argon2 (MIT/Apache-2.0)    — Argon2id key derivation
+  wasm-bindgen (MIT/Apache-2.0) — WebAssembly bindings (aether-wasm)
+
+See each crate's license for full terms.
