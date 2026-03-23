@@ -63,7 +63,12 @@ pub fn compress_chunk(
             // The predictor sees the RLE stream, not the raw MTF stream.
             // bwt_mtf_encode_parts returns Err if input exceeds MAX_BWT_INPUT_SIZE;
             // we treat that as "BWT not applicable" and fall through to LZ77/plain.
-            if chunk.data.len() >= 8 {
+            //
+            // Skip BWT for high-entropy chunks (>6.5 bps) — suffix array
+            // construction is expensive and BWT clustering provides minimal
+            // benefit on near-random data.  Text is typically 4-5 bps.
+            const BWT_ENTROPY_SKIP: f64 = 6.5;
+            if chunk.data.len() >= 8 && chunk.entropy < BWT_ENTROPY_SKIP {
                 if let Ok((primary_index, mtf_data)) =
                     bwt_preprocess::bwt_mtf_encode_parts(&chunk.data)
                 {
