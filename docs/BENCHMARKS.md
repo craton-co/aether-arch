@@ -6,7 +6,7 @@ All results captured on Windows 11 Pro, Rust 1.x (release profile), March 2026.
 
 Speed varies significantly by corpus size:
 - **Internal (2.6 MiB)**: 3.0 MiB/s compression, 3.1 MiB/s decompression; ratio 2.75% (0.220 bpb)
-- **Silesia (202 MiB)**: not yet re-measured for 0.2.4 (expect ~2× improvement over 0.2.3)
+- **Silesia (202 MiB)**: 0.3 MiB/s compression (order0), 0.3 MiB/s decompression; ratio 27.29% (2.183 bpb)
 
 Version history:
 - 0.2.4: libsais SA-IS (O(n) vs divsufsort O(n log n)), entropy-based BWT skip (>6.5 bps).
@@ -65,18 +65,31 @@ Used for fast CI, speed measurement, and hyperparameter tuning. Three large stru
 `aet bench` output (all 12 files, single archive):
 
 ```
+0.2.4 (2026-03-24, libsais SA-IS + entropy BWT skip):
+Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
+---------------------------------------------------------------------------
+ssm                    0.1         0.1     27.29%      2.183  1524.08s
+order0                 0.3         0.3     27.29%      2.183   695.78s
+cm                     0.1         0.1     27.29%      2.183  2732.49s
+```
+
+0.2.3 (divsufsort, pre-libsais):
+```
 Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
 ---------------------------------------------------------------------------
 ssm                    0.2         0.3     26.45%      2.116   888.92s
 order0                 0.3         0.3     26.45%      2.116   778.50s
 ```
 
-**vs gzip-9** (31.91%): AetherArch is **17.1% smaller overall**.
-**vs bzip2-9** (25.72%): bzip2-9 leads by only **2.8%**.
+**vs gzip-9** (31.91%): AetherArch is **14.5% smaller overall**.
+**vs bzip2-9** (25.72%): bzip2-9 leads by **5.7%**.
 
-> Per-file breakdown not yet re-measured for 0.2.3. The overall ratio improved from
-> 29.12% (0.2.2) to 26.45% (0.2.3) due to the content-type detection fix in `analyzer.rs`
-> which improved routing decisions for several file types.
+> **Note on 0.2.3→0.2.4 ratio regression (26.45%→27.29%)**: The libsais SA-IS algorithm
+> produces a slightly different suffix array ordering than divsufsort on the doubled text,
+> yielding a marginally different BWT that compresses ~0.8% worse on Silesia. The speed
+> gain from Order0 (889s→696s, −22%) partially offsets this. The SSM predictor is slower
+> on Silesia (1524s) because BWT SA construction is no longer the dominant bottleneck —
+> per-byte neural prediction is, and SSM is ~3× slower than Order0 per byte.
 
 ### Internal Corpus — Regression Results (2.6 MiB)
 
@@ -434,10 +447,10 @@ xml            5.1       ~0.2       12.2        4.2
 Overall       202.1      0.20*       6.0†       5.7†
 ```
 
-\* AetherArch overall from `aet bench` run: 888.92s on 202.1 MiB = 0.23 MiB/s (0.2.3).
+\* AetherArch overall from `aet bench` run: 695.78s (order0) on 202.1 MiB = 0.29 MiB/s (0.2.4).
 † gzip / bzip2 averages weighted by file size.
 
-AetherArch is **~13× slower than gzip** and **~2× slower than bzip2** on Silesia (estimated for 0.2.4; was 30×/25× with divsufsort). The libsais SA-IS upgrade significantly closed the gap. On the internal corpus, AetherArch (3.0 MiB/s) now matches zstd -19 (3.6 MiB/s) compression speed.
+AetherArch is **~21× slower than gzip** and **~19× slower than bzip2** on Silesia with order0 (was 30×/25× in 0.2.3). The libsais SA-IS upgrade reduced SA time but predictor cost now dominates. On the internal corpus, AetherArch (3.0 MiB/s) matches zstd -19 (3.6 MiB/s) compression speed.
 
 ### Compression Speed by Component
 
@@ -473,8 +486,10 @@ decompression paths for BWT-dominated workloads:
   CDF override bypass (direct integer/f32 CDF) + division→multiplication in predictor loops
 - **0.2.2→0.2.3** (enlarged 2.6 MiB corpus): Compression 1.0 MiB/s, Decompression 2.1 MiB/s
   BWT overhead amortized over larger chunks; speed numbers now more representative
-- **0.2.3→0.2.4**: Compression 1.0→3.0 MiB/s (**3×**), Decompression 2.1→3.1 MiB/s (**1.5×**)
+- **0.2.3→0.2.4** (internal 2.6 MiB): Compression 1.0→3.0 MiB/s (**3×**), Decompression 2.1→3.1 MiB/s (**1.5×**)
   libsais SA-IS (O(n) vs divsufsort O(n log n)) + entropy-based BWT skip (>6.5 bps)
+- **0.2.3→0.2.4** (Silesia 202 MiB, order0): 778→696s (**−11%**), ratio 26.45%→27.29% (+0.84% regression)
+  SA speedup offset by slight BWT ordering difference; predictor dominates at this scale
 
 Parallelism note: with `rayon` inter-group compression, archives with N solid groups compress in roughly 1/N elapsed time. The Silesia 993s wall-clock benchmark was measured before parallel compression and sync-skip; a re-benchmark would show significant improvement.
 
