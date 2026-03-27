@@ -50,10 +50,6 @@ pub const MAX_BWT_INPUT_SIZE: usize = 8 * 1024 * 1024;
 /// (linear-time SA-IS) and keep only positions < n.  This produces a valid
 /// cyclic rotation suffix array, from which we extract the BWT.
 ///
-/// Using `libsais` (O(n) SA-IS) instead of `divsufsort` (O(n log n)) gives
-/// a significant speedup while maintaining identical BWT output compatible
-/// with our LF-mapping decoder.
-///
 /// Returns (bwt_output, primary_index).
 /// Time: O(n) (libsais SA-IS on 2n bytes). Memory: ~10n peak.
 ///

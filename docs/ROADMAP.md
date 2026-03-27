@@ -159,9 +159,9 @@ Grow adoption and lay groundwork for revenue.
   - Binary search in range coder decode (256→8 comparisons)
   - `#[inline]` hints on predictor predict/update hot paths
   - Precomputed `a_inv` array for NeuralSSM EMA vectorization
-- [x] Early entropy-based BWT skip — skip SA construction for high-entropy chunks (>6.5 bps)
-  - Text is typically 4-5 bps; binary/compressed data above 6.5 bps skips expensive SA entirely
-  - Chunks fall through to LZ77/plain/Zstd paths instead
+- [x] Early entropy-based BWT skip — skip SA construction for high-entropy chunks (>7.0 bps)
+  - Text is typically 4-5 bps; near-random data above 7.0 bps skips expensive SA entirely
+  - Tuned from 6.5→7.0 bps: 6.5 caused 0.84% ratio regression on Silesia by skipping BWT-beneficial chunks
 - [ ] Target 2+ MiB/s compression, 5+ MiB/s decompression
 
 ### Marketing
