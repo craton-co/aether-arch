@@ -76,6 +76,7 @@ fn bwt_encode(data: &[u8]) -> std::result::Result<(Vec<u8>, u32), &'static str> 
 
     // Build suffix array of T+T using libsais (linear-time SA-IS).
     let doubled_len = doubled.len();
+    debug_assert!(doubled_len <= i32::MAX as usize, "doubled_len overflows i32 for libsais");
     let mut sa = vec![0i32; doubled_len];
     // SAFETY: libsais reads doubled_len bytes from doubled and writes
     // doubled_len i32 entries to sa.  Both buffers are correctly sized.
