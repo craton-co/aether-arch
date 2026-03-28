@@ -4,15 +4,11 @@
 //! MTF converts the clustered data into a stream of mostly small values
 //! (0s and 1s), which entropy codes compress extremely well.
 //!
-//! BWT is computed via `divsufsort` (pure-Rust port of Yuta Mori's
-//! libdivsufsort) using the **doubled-text trick**: we sort suffixes of
-//! T+T (the text concatenated with itself) and keep only positions < n.
-//! Any two positions i,j < n in T+T have ≥ n characters to compare,
-//! which is exactly the cyclic rotation content, so the filtered suffix
-//! SA equals the cyclic rotation SA.  This is O(n log n) in practice,
-//! versus the O(n log² n) prefix-doubling fallback it replaces.
-//!
-//! No C FFI dependencies — the entire BWT pipeline is pure Rust.
+//! BWT is computed via `libsais` (Ilya Grebnov's linear-time SA-IS
+//! algorithm, via C FFI) using the **doubled-text trick**: we sort
+//! suffixes of T+T and keep only positions < n to obtain the cyclic
+//! rotation SA.  This is O(n) via SA-IS (vs O(n log n) with divsufsort),
+//! with the same ~10n peak memory for the doubled text + suffix array.
 //!
 //! Output format: `[primary_index: u32 LE] [MTF data...]`
 //! Total size = input size + 4 bytes.
@@ -33,7 +29,7 @@ const MAX_BWT_DECODE_SIZE: usize = crate::format::MAX_DECOMPRESSED_BLOCK_SIZE;
 /// Maximum input size for BWT encoding (8 MiB).
 ///
 /// The doubled-text trick allocates `2 * n` bytes for the text and
-/// `divsufsort` allocates `~4 * 2n = 8n` bytes for the suffix array,
+/// `libsais` allocates `~4 * 2n = 8n` bytes for the suffix array,
 /// giving a total peak memory of roughly **10× the input size**.
 ///
 /// With 8 MiB input → ~80 MiB peak per BWT call.  Since solid groups are
@@ -47,24 +43,17 @@ pub const MAX_BWT_INPUT_SIZE: usize = 8 * 1024 * 1024;
 
 // ── BWT (Burrows-Wheeler Transform) ─────────────────────────────────────────
 
-/// Compute BWT using divsufsort (pure Rust) via the doubled-text trick.
+#[cfg(feature = "bwt-encode")]
+/// Compute BWT using the doubled-text trick with `libsais` SA-IS algorithm.
 ///
-/// We sort suffixes of T+T (text repeated twice) and keep only positions < n.
-/// Any two positions i,j < n in T+T compare at least n characters, which are
-/// exactly the cyclic rotations starting at i and j.  The filtered result is
-/// therefore a valid cyclic rotation suffix array, producing a BWT that our
-/// standard LF-mapping decoder handles correctly.
+/// We sort suffixes of T+T (text concatenated with itself) using `libsais`
+/// (linear-time SA-IS) and keep only positions < n.  This produces a valid
+/// cyclic rotation suffix array, from which we extract the BWT.
 ///
 /// Returns (bwt_output, primary_index).
-/// Time: O(n log n) (divsufsort, pure Rust). Memory: O(n) extra.
+/// Time: O(n) (libsais SA-IS on 2n bytes). Memory: ~10n peak.
 ///
-/// # Memory
-///
-/// Peak memory is approximately `10 × data.len()`:
-/// - `2n` for the doubled text
-/// - `~8n` for the suffix array (`i32` per position of the `2n` text)
-///
-/// Returns `None` (via the caller) for inputs exceeding [`MAX_BWT_INPUT_SIZE`].
+/// Returns `Err` for inputs exceeding [`MAX_BWT_INPUT_SIZE`].
 fn bwt_encode(data: &[u8]) -> std::result::Result<(Vec<u8>, u32), &'static str> {
     let n = data.len();
     if n == 0 {
@@ -85,15 +74,31 @@ fn bwt_encode(data: &[u8]) -> std::result::Result<(Vec<u8>, u32), &'static str> 
     doubled.extend_from_slice(data);
     doubled.extend_from_slice(data);
 
-    // Sort suffixes of T+T; extract the i32 SA via into_parts().
-    let (_, sa_doubled) = divsufsort::sort(&doubled).into_parts();
+    // Build suffix array of T+T using libsais (linear-time SA-IS).
+    let doubled_len = doubled.len();
+    debug_assert!(doubled_len <= i32::MAX as usize, "doubled_len overflows i32 for libsais");
+    let mut sa = vec![0i32; doubled_len];
+    // SAFETY: libsais reads doubled_len bytes from doubled and writes
+    // doubled_len i32 entries to sa.  Both buffers are correctly sized.
+    let rc = unsafe {
+        libsais_sys::libsais::libsais(
+            doubled.as_ptr(),
+            sa.as_mut_ptr(),
+            doubled_len as i32,
+            0,                    // fs: no extra space
+            std::ptr::null_mut(), // freq: not needed
+        )
+    };
+    if rc != 0 {
+        return Err("libsais suffix array construction failed");
+    }
 
     // Scan in sorted order, keep only positions < n to build the cyclic BWT.
     let mut bwt = Vec::with_capacity(n);
     let mut primary_index = 0u32;
 
-    for &s in &sa_doubled {
-        let pos = s as usize; // SA values are non-negative indices
+    for &s in &sa {
+        let pos = s as usize;
         if pos < n {
             if pos == 0 {
                 primary_index = bwt.len() as u32;
@@ -328,6 +333,7 @@ pub fn rle_decode(rle_data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
 
 // ── Combined API ────────────────────────────────────────────────────────────
 
+#[cfg(feature = "bwt-encode")]
 /// Apply BWT + MTF preprocessing.
 ///
 /// Returns `Ok((primary_index, mtf_data))` or `Err` if the input exceeds
@@ -339,6 +345,7 @@ pub fn bwt_mtf_encode_parts(data: &[u8]) -> Result<(u32, Vec<u8>)> {
     Ok((primary_index, mtf_data))
 }
 
+#[cfg(feature = "bwt-encode")]
 /// Apply BWT + MTF preprocessing (legacy format).
 ///
 /// Returns encoded bytes: `[primary_index: u32 LE] [MTF data...]`

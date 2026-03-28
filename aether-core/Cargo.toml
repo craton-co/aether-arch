@@ -21,7 +21,7 @@ rayon = { workspace = true, optional = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
 lz4_flex = { workspace = true, optional = true }
-divsufsort = { workspace = true }
+libsais-sys = { workspace = true, optional = true }
 tempfile = "3"
 filetime = "0.2"
 aes-gcm = { version = "0.10", optional = true }
@@ -41,7 +41,10 @@ name = "compression"
 harness = false
 
 [features]
-default = ["context-mixer", "lz4"]
+default = ["context-mixer", "lz4", "bwt-encode"]
+## BWT encoding via libsais (C FFI). Required for compression.
+## Disable for decompress-only targets (e.g., wasm).
+bwt-encode = ["dep:libsais-sys"]
 ## PAQ-inspired context-mixing predictor (~100 MiB per instance).
 ## Disable to reduce binary size and memory usage if only NeuralSSM is needed.
 context-mixer = []

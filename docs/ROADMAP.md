@@ -143,7 +143,13 @@ Grow adoption and lay groundwork for revenue.
 - [ ] Solid append (add files without full rewrite)
 
 ### Performance
-- [x] Replace `cdivsufsort` C binding with pure-Rust suffix array (`divsufsort` crate)
+- [x] Replace `cdivsufsort` C binding with `divsufsort` crate, then `libsais` SA-IS (O(n) linear time)
+  - Re-evaluated libsais: SA-based BWT (without doubled text) is incompatible with cyclic-rotation
+    LF-mapping decoder (different primary index semantics). Direct `libsais_bwt` roundtrip fails.
+  - Solution: use `libsais` for O(n) suffix array construction on doubled text T+T, preserving
+    cyclic rotation extraction. Faster than divsufsort O(n log n) with identical BWT output.
+  - C FFI concern resolved: project already depends on C FFI via `zstd-sys`.
+  - Feature-gated behind `bwt-encode` (default on); wasm decompress-only unaffected.
 - [x] Criterion benchmarks (`cargo bench -p aether-core`)
   - Roundtrip (compress + decompress) with Order0 and NeuralSSM predictors
   - BWT+MTF+RLE encode/decode throughput
@@ -153,6 +159,9 @@ Grow adoption and lay groundwork for revenue.
   - Binary search in range coder decode (256→8 comparisons)
   - `#[inline]` hints on predictor predict/update hot paths
   - Precomputed `a_inv` array for NeuralSSM EMA vectorization
+- [x] Early entropy-based BWT skip — skip SA construction for high-entropy chunks (>7.0 bps)
+  - Text is typically 4-5 bps; near-random data above 7.0 bps skips expensive SA entirely
+  - Tuned from 6.5→7.0 bps: 6.5 caused 0.84% ratio regression on Silesia by skipping BWT-beneficial chunks
 - [ ] Target 2+ MiB/s compression, 5+ MiB/s decompression
 
 ### Marketing
@@ -202,7 +211,8 @@ Systematic speed optimization of compression and decompression hot paths.
 - [x] `fast_ln()` in SSM mixer — ratio regression 27.37%→27.54% (mixer weighting precision-sensitive)
 - [x] 16 order-2 context buckets — ratio regression 27.37%→27.47% (count fragmentation on small corpus)
 - [x] Unrolled binary search in `decode_cdf()` — 16% slower (instruction cache pressure)
-- [x] SA-based BWT — mathematically incorrect for cyclic rotations; `libsais` needs C FFI (removed in V2.0)
+- [x] SA-based BWT (direct, without doubled text) — confirmed incompatible with cyclic-rotation decoder.
+  Re-evaluated in 0.2.4: `libsais` now used for SA construction on doubled text instead (see Phase 3).
 
 ### Deferred
 - [ ] Cross-block predictor state carry — requires format versioning, 4 decompressor call sites
