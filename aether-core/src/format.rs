@@ -188,6 +188,8 @@ pub enum CompressionMethod {
     Lz77PredictorRans = 4,
     /// BWT + MTF preprocessing + Predictor + Range Coding (best for text)
     BwtPredictorRans = 5,
+    /// Byte-plane splitting + per-plane Range Coding (best for numeric/float arrays)
+    BytePlanePredictorRans = 6,
 }
 
 impl CompressionMethod {
@@ -199,6 +201,7 @@ impl CompressionMethod {
             3 => Ok(Self::LzPredictorRans),
             4 => Ok(Self::Lz77PredictorRans),
             5 => Ok(Self::BwtPredictorRans),
+            6 => Ok(Self::BytePlanePredictorRans),
             other => Err(AetherError::UnknownCompressionMethod(other)),
         }
     }
@@ -218,6 +221,8 @@ pub enum ContentType {
     BinaryRandom = 3,
     Image = 4,
     Executable = 5,
+    /// Numeric arrays / tensor data (float weights, embeddings, etc.)
+    NumericData = 6,
 }
 
 impl ContentType {
@@ -229,6 +234,7 @@ impl ContentType {
             3 => Ok(Self::BinaryRandom),
             4 => Ok(Self::Image),
             5 => Ok(Self::Executable),
+            6 => Ok(Self::NumericData),
             other => Err(AetherError::UnknownContentType(other)),
         }
     }
@@ -341,6 +347,7 @@ mod tests {
             CompressionMethod::LzPredictorRans,
             CompressionMethod::Lz77PredictorRans,
             CompressionMethod::BwtPredictorRans,
+            CompressionMethod::BytePlanePredictorRans,
         ] {
             let v = m as u8;
             assert_eq!(CompressionMethod::from_u8(v).unwrap(), m);
@@ -356,6 +363,7 @@ mod tests {
             ContentType::BinaryRandom,
             ContentType::Image,
             ContentType::Executable,
+            ContentType::NumericData,
         ] {
             let v = ct as u16;
             assert_eq!(ContentType::from_u16(v).unwrap(), ct);
