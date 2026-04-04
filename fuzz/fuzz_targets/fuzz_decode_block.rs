@@ -20,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Use first byte to select compression method, second byte for flags,
     // third byte to select predictor type.
-    let method_byte = data[0] % 6;
+    let method_byte = data[0] % 7;
     let predictor_synced = (data[1] & 1) != 0;
     let predictor_type = data[2] % 2;
     let payload = &data[3..];
@@ -32,7 +32,8 @@ fuzz_target!(|data: &[u8]| {
         3 => CompressionMethod::LzPredictorRans,
         4 => CompressionMethod::Lz77PredictorRans,
         5 => CompressionMethod::BwtPredictorRans,
-        _ => unreachable!(), // method_byte = data[0] % 6, so 0..=5 is exhaustive
+        6 => CompressionMethod::BytePlanePredictorRans,
+        _ => unreachable!(), // method_byte = data[0] % 7, so 0..=6 is exhaustive
     };
 
     // Use a reasonable uncompressed size (capped to avoid OOM in fuzzer)
