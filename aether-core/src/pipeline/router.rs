@@ -19,7 +19,9 @@ use crate::coding::lz_preprocess;
 use crate::coding::{bwt_preprocess, lz77_preprocess, rans, zstd_fallback};
 use crate::entropy::{NeuralSsmPredictor, ProbabilityPredictor};
 use crate::error::{AetherError, Result};
-use crate::format::{CompressionMethod, ContentType, BWT_DECISIVE_RATIO, MAX_DECOMPRESSED_BLOCK_SIZE};
+use crate::format::{
+    CompressionMethod, ContentType, BWT_DECISIVE_RATIO, MAX_DECOMPRESSED_BLOCK_SIZE,
+};
 
 /// Result of compressing a single chunk via the adaptive routing cascade.
 ///
@@ -71,19 +73,28 @@ pub fn compress_chunk(
             let is_numeric = content_type == ContentType::NumericData;
             if is_numeric {
                 if let Some(width) = byteplane_preprocess::detect_numeric_width(&chunk.data) {
-                    if let Some(payload) = byteplane_preprocess::byteplane_encode(&chunk.data, width) {
+                    if let Some(payload) =
+                        byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                    {
                         if payload.len() < chunk.data.len() {
                             best = Some((CompressionMethod::BytePlanePredictorRans, payload));
                         }
                     }
                 } else {
                     // Auto-detect failed; try both widths
-                    for &width in &[byteplane_preprocess::BytePlaneWidth::Two, byteplane_preprocess::BytePlaneWidth::Four] {
+                    for &width in &[
+                        byteplane_preprocess::BytePlaneWidth::Two,
+                        byteplane_preprocess::BytePlaneWidth::Four,
+                    ] {
                         if byteplane_preprocess::is_byteplane_beneficial(&chunk.data, width) {
-                            if let Some(payload) = byteplane_preprocess::byteplane_encode(&chunk.data, width) {
-                                let is_better = best.as_ref().is_none_or(|(_, b)| payload.len() < b.len());
+                            if let Some(payload) =
+                                byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                            {
+                                let is_better =
+                                    best.as_ref().is_none_or(|(_, b)| payload.len() < b.len());
                                 if payload.len() < chunk.data.len() && is_better {
-                                    best = Some((CompressionMethod::BytePlanePredictorRans, payload));
+                                    best =
+                                        Some((CompressionMethod::BytePlanePredictorRans, payload));
                                 }
                             }
                         }
@@ -169,7 +180,9 @@ pub fn compress_chunk(
             // contain embedded float tables that benefit from splitting.
             if !is_numeric && content_type != ContentType::Text {
                 if let Some(width) = byteplane_preprocess::detect_numeric_width(&chunk.data) {
-                    if let Some(payload) = byteplane_preprocess::byteplane_encode(&chunk.data, width) {
+                    if let Some(payload) =
+                        byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                    {
                         let is_better = best.as_ref().is_none_or(|(_, b)| payload.len() < b.len());
                         if payload.len() < chunk.data.len() && is_better {
                             best = Some((CompressionMethod::BytePlanePredictorRans, payload));
@@ -287,7 +300,8 @@ pub fn decompress_chunk(
 
     match method {
         CompressionMethod::BytePlanePredictorRans => {
-            let original = byteplane_preprocess::byteplane_decode(compressed_data, uncompressed_size)?;
+            let original =
+                byteplane_preprocess::byteplane_decode(compressed_data, uncompressed_size)?;
             if predictor_synced {
                 sync_predictor(predictor, &original);
             }

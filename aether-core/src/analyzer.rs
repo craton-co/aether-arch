@@ -144,8 +144,8 @@ fn detect_from_extension(path: &str) -> ContentType {
 
     match ext {
         // Numeric / tensor data
-        "npy" | "npz" | "safetensors" | "gguf" | "ggml" | "bin" | "weight" | "weights"
-        | "pt" | "pth" | "ot" | "tflite" | "pb" | "onnx" => ContentType::NumericData,
+        "npy" | "npz" | "safetensors" | "gguf" | "ggml" | "bin" | "weight" | "weights" | "pt"
+        | "pth" | "ot" | "tflite" | "pb" | "onnx" => ContentType::NumericData,
 
         // Text / Code
         "txt" | "md" | "rst" | "csv" | "tsv" | "log" => ContentType::Text,

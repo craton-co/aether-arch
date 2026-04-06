@@ -168,10 +168,8 @@ pub fn detect_numeric_width(data: &[u8]) -> Option<BytePlaneWidth> {
         let plane0_entropy = shannon_entropy(&plane0);
 
         let benefit = shannon_entropy(data) - plane0_entropy;
-        if benefit > 1.5 {
-            if best.as_ref().is_none_or(|(_, b)| benefit > *b) {
-                best = Some((width, benefit));
-            }
+        if benefit > 1.5 && best.as_ref().is_none_or(|(_, b)| benefit > *b) {
+            best = Some((width, benefit));
         }
     }
 
@@ -276,10 +274,7 @@ pub fn byteplane_decode(payload: &[u8], uncompressed_size: usize) -> crate::erro
     }
 
     let width = BytePlaneWidth::from_u8(payload[0]).ok_or_else(|| {
-        AetherError::Decompression(format!(
-            "BytePlane: invalid width byte {}",
-            payload[0]
-        ))
+        AetherError::Decompression(format!("BytePlane: invalid width byte {}", payload[0]))
     })?;
     let plane_flags = payload[1];
     let w = width.planes();
@@ -298,11 +293,10 @@ pub fn byteplane_decode(payload: &[u8], uncompressed_size: usize) -> crate::erro
     let mut plane_sizes = Vec::with_capacity(w);
     for i in 0..w {
         let offset = sizes_start + 4 * i;
-        let size = u32::from_le_bytes(
-            payload[offset..offset + 4]
-                .try_into()
-                .map_err(|_| AetherError::Decompression("BytePlane: truncated plane size".into()))?,
-        ) as usize;
+        let size =
+            u32::from_le_bytes(payload[offset..offset + 4].try_into().map_err(|_| {
+                AetherError::Decompression("BytePlane: truncated plane size".into())
+            })?) as usize;
 
         if size > MAX_DECOMPRESSED_BLOCK_SIZE {
             return Err(AetherError::ResourceLimitExceeded(format!(
