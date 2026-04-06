@@ -199,6 +199,171 @@ fn bench_range_coder(c: &mut Criterion) {
     group.finish();
 }
 
+// ── External tool comparison benchmarks ─────────────────────────────────────
+
+fn bench_vs_external(c: &mut Criterion) {
+    use std::process::Command;
+
+    // Concatenate all large fixture files into one blob
+    let large_dir = fixture_dir().join("large");
+    let mut data = Vec::new();
+    for name in &["english.txt", "source.rs", "mixed.json"] {
+        data.extend_from_slice(&std::fs::read(large_dir.join(name)).unwrap());
+    }
+    let total_bytes = data.len() as u64;
+
+    // Write to a temp file for external tools
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let input_path = tmp_dir.path().join("corpus.bin");
+    std::fs::write(&input_path, &data).unwrap();
+
+    let mut group = c.benchmark_group("vs_external");
+    group.throughput(Throughput::Bytes(total_bytes));
+    // External tools are fast; limit samples to keep total time reasonable
+    group.sample_size(20);
+
+    // ── AetherArch (compress only, in-memory) ───────────────────────
+    let (base_dir, files) = large_files();
+    group.bench_function("aetherarch_compress", |b| {
+        b.iter(|| {
+            let archive = compress_to_buf(&base_dir, &files, || Box::new(Order0Model::new()));
+            black_box(archive.len());
+        });
+    });
+
+    // ── Helper: benchmark an external compressor via file I/O ───────
+    // Returns None if the tool is not found on PATH.
+    fn bench_external_tool(
+        group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+        name: &str,
+        program: &str,
+        args: &[&str],
+        input: &std::path::Path,
+        output_ext: &str,
+    ) {
+        let output_path = input.with_extension(output_ext);
+        // Quick check: is the tool available?
+        if Command::new(program).arg("--version").output().is_err() {
+            eprintln!("  [{}] not found on PATH, skipping", name);
+            return;
+        }
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let mut cmd = Command::new(program);
+                for a in args {
+                    cmd.arg(a);
+                }
+                let status = cmd.status().expect("failed to run external tool");
+                assert!(status.success(), "{} failed", name);
+                let out_size = std::fs::metadata(&output_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                black_box(out_size);
+            });
+        });
+        // Clean up
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    let inp = &input_path;
+
+    // gzip -9 (file → file.gz)
+    bench_external_tool(
+        &mut group,
+        "gzip_9",
+        "gzip",
+        &["-9", "-k", "-f", inp.to_str().unwrap()],
+        inp,
+        "bin.gz",
+    );
+
+    // bzip2 -9 (file → file.bz2)
+    bench_external_tool(
+        &mut group,
+        "bzip2_9",
+        "bzip2",
+        &["-9", "-k", "-f", inp.to_str().unwrap()],
+        inp,
+        "bin.bz2",
+    );
+
+    // xz -9 (file → file.xz)
+    bench_external_tool(
+        &mut group,
+        "xz_9",
+        "xz",
+        &["-9", "-k", "-f", inp.to_str().unwrap()],
+        inp,
+        "bin.xz",
+    );
+
+    // zstd -19
+    {
+        let zst_out = tmp_dir.path().join("corpus.zst");
+        let zst_out_str = zst_out.to_str().unwrap().to_string();
+        let inp_str = inp.to_str().unwrap().to_string();
+        if Command::new("zstd").arg("--version").output().is_ok() {
+            group.bench_function("zstd_19", |b| {
+                b.iter(|| {
+                    let status = Command::new("zstd")
+                        .args(["-19", "-f", &inp_str, "-o", &zst_out_str, "--no-progress"])
+                        .status()
+                        .expect("zstd failed");
+                    assert!(status.success());
+                    let out_size = std::fs::metadata(&zst_out).map(|m| m.len()).unwrap_or(0);
+                    black_box(out_size);
+                });
+            });
+            let _ = std::fs::remove_file(&zst_out);
+        }
+    }
+
+    // brotli -q 11
+    {
+        let br_out = tmp_dir.path().join("corpus.br");
+        let br_out_str = br_out.to_str().unwrap().to_string();
+        let inp_str = inp.to_str().unwrap().to_string();
+        if Command::new("brotli").arg("--version").output().is_ok() {
+            group.bench_function("brotli_11", |b| {
+                b.iter(|| {
+                    let status = Command::new("brotli")
+                        .args(["-q", "11", "-f", &inp_str, "-o", &br_out_str])
+                        .status()
+                        .expect("brotli failed");
+                    assert!(status.success());
+                    let out_size = std::fs::metadata(&br_out).map(|m| m.len()).unwrap_or(0);
+                    black_box(out_size);
+                });
+            });
+            let _ = std::fs::remove_file(&br_out);
+        }
+    }
+
+    // lz4 -9
+    {
+        let lz4_out = tmp_dir.path().join("corpus.lz4");
+        let lz4_out_str = lz4_out.to_str().unwrap().to_string();
+        let inp_str = inp.to_str().unwrap().to_string();
+        if Command::new("lz4").arg("--version").output().is_ok() {
+            group.bench_function("lz4_9", |b| {
+                b.iter(|| {
+                    let status = Command::new("lz4")
+                        .args(["-9", "-f", &inp_str, &lz4_out_str])
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .expect("lz4 failed");
+                    assert!(status.success());
+                    let out_size = std::fs::metadata(&lz4_out).map(|m| m.len()).unwrap_or(0);
+                    black_box(out_size);
+                });
+            });
+            let _ = std::fs::remove_file(&lz4_out);
+        }
+    }
+
+    group.finish();
+}
+
 // ── Predictor benchmarks ────────────────────────────────────────────────────
 
 fn bench_predictors(c: &mut Criterion) {
@@ -243,6 +408,7 @@ criterion_group!(
     bench_roundtrip,
     bench_bwt,
     bench_range_coder,
+    bench_vs_external,
     bench_predictors,
 );
 criterion_main!(benches);

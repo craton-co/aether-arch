@@ -13,12 +13,15 @@
 
 use crate::analyzer::{self, RecommendedMethod};
 use crate::chunker::Chunk;
+use crate::coding::byteplane_preprocess;
 #[cfg(feature = "lz4")]
 use crate::coding::lz_preprocess;
 use crate::coding::{bwt_preprocess, lz77_preprocess, rans, zstd_fallback};
 use crate::entropy::{NeuralSsmPredictor, ProbabilityPredictor};
 use crate::error::{AetherError, Result};
-use crate::format::{CompressionMethod, BWT_DECISIVE_RATIO, MAX_DECOMPRESSED_BLOCK_SIZE};
+use crate::format::{
+    CompressionMethod, ContentType, BWT_DECISIVE_RATIO, MAX_DECOMPRESSED_BLOCK_SIZE,
+};
 
 /// Result of compressing a single chunk via the adaptive routing cascade.
 ///
@@ -57,6 +60,48 @@ pub fn compress_chunk(
         RecommendedMethod::PredictorRans => {
             let mut best: Option<(CompressionMethod, Vec<u8>)> = None;
 
+            // Single scratch predictor reused across all trial paths.
+            // encode_block() calls predictor.reset() at the start of every
+            // call, so state from a failed trial never bleeds into the next.
+            // Saves 2 heap allocations (~25 KiB each) per chunk.
+            let mut scratch = NeuralSsmPredictor::new();
+
+            // ── Try byte-plane splitting (numeric data fast path) ────
+            // For NumericData content, try byte-plane first and skip
+            // BWT/LZ77 if it wins decisively. For other content types,
+            // still try byte-plane as a competing method after BWT/LZ77.
+            let is_numeric = content_type == ContentType::NumericData;
+            if is_numeric {
+                if let Some(width) = byteplane_preprocess::detect_numeric_width(&chunk.data) {
+                    if let Some(payload) =
+                        byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                    {
+                        if payload.len() < chunk.data.len() {
+                            best = Some((CompressionMethod::BytePlanePredictorRans, payload));
+                        }
+                    }
+                } else {
+                    // Auto-detect failed; try both widths
+                    for &width in &[
+                        byteplane_preprocess::BytePlaneWidth::Two,
+                        byteplane_preprocess::BytePlaneWidth::Four,
+                    ] {
+                        if byteplane_preprocess::is_byteplane_beneficial(&chunk.data, width) {
+                            if let Some(payload) =
+                                byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                            {
+                                let is_better =
+                                    best.as_ref().is_none_or(|(_, b)| payload.len() < b.len());
+                                if payload.len() < chunk.data.len() && is_better {
+                                    best =
+                                        Some((CompressionMethod::BytePlanePredictorRans, payload));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // ── Try BWT+MTF+RLE → predictor + range coding ────────────
             // BWT clusters context; MTF converts to small integers; RLE
             // compacts zero runs using bijective base-2 (RUNA/RUNB).
@@ -83,8 +128,7 @@ pub fn compress_chunk(
                             (mtf_data, false)
                         };
 
-                    let mut bwt_predictor = NeuralSsmPredictor::new();
-                    if let Ok(rc_bytes) = rans::encode_block(&encode_data, &mut bwt_predictor) {
+                    if let Ok(rc_bytes) = rans::encode_block(&encode_data, &mut scratch) {
                         // Payload: [flags: u8] [primary_index: u32] [encoded_len: u32] [RC bytes]
                         let flags: u8 = if rle_applied { 1 } else { 0 };
                         let encoded_len = encode_data.len() as u32;
@@ -111,11 +155,8 @@ pub fn compress_chunk(
             });
             if !bwt_decisive {
                 if let Some(lz_bytes) = lz77_preprocess::lz77_encode(&chunk.data) {
-                    // Use a fresh predictor for the LZ77 trial so that a
-                    // failed attempt does not corrupt the group predictor's
-                    // state. The winning path syncs via sync_predictor below.
-                    let mut lz_predictor = NeuralSsmPredictor::new();
-                    if let Ok(rc_bytes) = rans::encode_block(&lz_bytes, &mut lz_predictor) {
+                    // Reuse scratch predictor (encode_block resets it first).
+                    if let Ok(rc_bytes) = rans::encode_block(&lz_bytes, &mut scratch) {
                         let lz_len = lz_bytes.len() as u32;
 
                         let mut payload = Vec::with_capacity(4 + rc_bytes.len());
@@ -133,12 +174,27 @@ pub fn compress_chunk(
                 }
             }
 
+            // ── Try byte-plane splitting (non-numeric fallback) ─────
+            // For non-text, non-numeric content, try byte-plane as a
+            // competing method. Executables and structured binary can
+            // contain embedded float tables that benefit from splitting.
+            if !is_numeric && content_type != ContentType::Text {
+                if let Some(width) = byteplane_preprocess::detect_numeric_width(&chunk.data) {
+                    if let Some(payload) =
+                        byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                    {
+                        let is_better = best.as_ref().is_none_or(|(_, b)| payload.len() < b.len());
+                        if payload.len() < chunk.data.len() && is_better {
+                            best = Some((CompressionMethod::BytePlanePredictorRans, payload));
+                        }
+                    }
+                }
+            }
+
             // ── Try plain predictor + range coding ───────────────────
-            // Use a fresh predictor so a failed attempt does not corrupt
-            // the group predictor's state (encode_block calls reset()).
+            // Reuse scratch predictor (encode_block resets it first).
             if best.is_none() {
-                let mut plain_predictor = NeuralSsmPredictor::new();
-                if let Ok(rc_bytes) = rans::encode_block(&chunk.data, &mut plain_predictor) {
+                if let Ok(rc_bytes) = rans::encode_block(&chunk.data, &mut scratch) {
                     if rc_bytes.len() < chunk.data.len() {
                         best = Some((CompressionMethod::PredictorRans, rc_bytes));
                     }
@@ -170,17 +226,12 @@ pub fn compress_chunk(
             // the decompressor.
             if let Some((method, payload)) = best {
                 match method {
-                    CompressionMethod::BwtPredictorRans => {
-                        // BWT uses its own predictor internally; sync the group
-                        // predictor on the original data for cross-block state.
-                        // Skip when BWT won decisively: subsequent chunks of the
-                        // same content type will also use BWT, so this state is
-                        // unlikely to be consumed by a LZ77/plain path block.
-                        if !bwt_decisive {
-                            sync_predictor(predictor, &chunk.data);
-                        } else {
-                            predictor_synced = false;
-                        }
+                    CompressionMethod::BwtPredictorRans
+                    | CompressionMethod::BytePlanePredictorRans => {
+                        // BWT and byte-plane both use their own internal
+                        // predictors, so the group predictor's state is not
+                        // meaningful. Skip sync to avoid O(n) waste.
+                        predictor_synced = false;
                     }
                     CompressionMethod::Lz77PredictorRans | CompressionMethod::PredictorRans => {
                         // Feed original data (not the LZ77/RC encoded form)
@@ -248,6 +299,14 @@ pub fn decompress_chunk(
     }
 
     match method {
+        CompressionMethod::BytePlanePredictorRans => {
+            let original =
+                byteplane_preprocess::byteplane_decode(compressed_data, uncompressed_size)?;
+            if predictor_synced {
+                sync_predictor(predictor, &original);
+            }
+            Ok(original)
+        }
         CompressionMethod::BwtPredictorRans => {
             if compressed_data.len() < 9 {
                 return Err(crate::error::AetherError::Decompression(format!(

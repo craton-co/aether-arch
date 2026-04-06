@@ -57,6 +57,24 @@ fn detect_from_magic(data: &[u8]) -> Option<ContentType> {
         return None;
     }
 
+    // NumPy .npy format: "\x93NUMPY"
+    if data.len() >= 6 && data.starts_with(&[0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59]) {
+        return Some(ContentType::NumericData);
+    }
+    // Safetensors: starts with '{' followed by JSON metadata (8-byte LE length prefix + '{')
+    // The first 8 bytes are the metadata length, then JSON starting with '{'
+    if data.len() >= 9 {
+        let meta_len = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
+        if meta_len > 0 && meta_len < 100_000_000 && data[8] == b'{' {
+            // Heuristic: looks like safetensors header
+            return Some(ContentType::NumericData);
+        }
+    }
+    // GGUF format: "GGUF" magic
+    if data.starts_with(b"GGUF") {
+        return Some(ContentType::NumericData);
+    }
+
     // ELF binary
     if data.starts_with(b"\x7fELF") {
         return Some(ContentType::Executable);
@@ -125,6 +143,10 @@ fn detect_from_extension(path: &str) -> ContentType {
     let ext = lower.rsplit('.').next().unwrap_or("");
 
     match ext {
+        // Numeric / tensor data
+        "npy" | "npz" | "safetensors" | "gguf" | "ggml" | "bin" | "weight" | "weights" | "pt"
+        | "pth" | "ot" | "tflite" | "pb" | "onnx" => ContentType::NumericData,
+
         // Text / Code
         "txt" | "md" | "rst" | "csv" | "tsv" | "log" => ContentType::Text,
         "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "hpp" | "java" | "go" | "rb" | "php"
@@ -191,6 +213,8 @@ pub fn recommend_method_for(entropy: f64, content_type: ContentType) -> Recommen
                 RecommendedMethod::Zstd
             }
         }
+        // Numeric data: predictor with byte-plane splitting
+        ContentType::NumericData => recommend_method(entropy),
         // Text, code, structured: predictor shines
         _ => recommend_method(entropy),
     }
