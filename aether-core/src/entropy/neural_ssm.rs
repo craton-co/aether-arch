@@ -605,7 +605,29 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
     }
 
     fn reset(&mut self) {
-        *self = Self::with_config(self.cfg.clone());
+        // Zero only mutable state in-place. Deterministic fields (cfg, a, a_inv,
+        // embed) are pure functions of config and never need recomputation.
+        // This avoids 2 Box re-allocations and 8192 det_hash() calls per reset.
+        self.h.fill(0.0);
+        self.w_run.fill(0.0);
+        self.b_run = 0.0;
+        self.w_runa.fill(0.0);
+        self.b_runa = 0.0;
+        self.ssm_perf = 0.0;
+        self.rle_perf = 0.0;
+        for ctx in self.o2_lit_counts.iter_mut() {
+            ctx.fill(0);
+        }
+        self.o2_lit_totals.fill(0);
+        self.prev_byte = 0xFF;
+        self.prev_prev_byte = 0xFF;
+        self.last_rle_probs.fill(1.0 / 256.0);
+        self.last_ssm_p_run = 0.5;
+        self.last_ssm_p_runa = 0.5;
+        self.last_rle_p_run = 0.5;
+        self.last_rle_p_runa = 0.5;
+        self.step = 0;
+        self.rle.reset();
     }
 
     fn name(&self) -> &str {
@@ -941,15 +963,65 @@ mod tests {
     #[test]
     fn reset_restores_initial_state() {
         let mut pred = NeuralSsmPredictor::new();
-        for _ in 0..50 {
+        // Dirty every field by training on varied data
+        let dirty: Vec<u8> = (0..200).map(|i| (i * 7 + 3) as u8).collect();
+        for &b in &dirty {
             pred.predict();
-            pred.update(0);
+            pred.update(b);
         }
         pred.reset();
-        let fresh = NeuralSsmPredictor::new();
-        assert_eq!(pred.h, fresh.h);
-        assert_eq!(pred.step, fresh.step);
-        assert_eq!(pred.b_run, fresh.b_run);
+
+        // Verify field-by-field against a fresh instance
+        let mut fresh = NeuralSsmPredictor::new();
+        assert_eq!(pred.h, fresh.h, "h mismatch after reset");
+        assert_eq!(pred.w_run, fresh.w_run, "w_run mismatch");
+        assert_eq!(pred.b_run, fresh.b_run, "b_run mismatch");
+        assert_eq!(pred.w_runa, fresh.w_runa, "w_runa mismatch");
+        assert_eq!(pred.b_runa, fresh.b_runa, "b_runa mismatch");
+        assert_eq!(pred.ssm_perf, fresh.ssm_perf, "ssm_perf mismatch");
+        assert_eq!(pred.rle_perf, fresh.rle_perf, "rle_perf mismatch");
+        assert_eq!(pred.o2_lit_totals, fresh.o2_lit_totals, "o2_lit_totals mismatch");
+        assert_eq!(pred.prev_byte, fresh.prev_byte, "prev_byte mismatch");
+        assert_eq!(pred.prev_prev_byte, fresh.prev_prev_byte, "prev_prev_byte mismatch");
+        assert_eq!(pred.last_rle_probs, fresh.last_rle_probs, "last_rle_probs mismatch");
+        assert_eq!(pred.last_ssm_p_run, fresh.last_ssm_p_run, "last_ssm_p_run mismatch");
+        assert_eq!(pred.last_ssm_p_runa, fresh.last_ssm_p_runa, "last_ssm_p_runa mismatch");
+        assert_eq!(pred.last_rle_p_run, fresh.last_rle_p_run, "last_rle_p_run mismatch");
+        assert_eq!(pred.last_rle_p_runa, fresh.last_rle_p_runa, "last_rle_p_runa mismatch");
+        assert_eq!(pred.step, fresh.step, "step mismatch");
+        assert_eq!(*pred.o2_lit_counts, *fresh.o2_lit_counts, "o2_lit_counts mismatch");
+
+        // Prediction equivalence: feed same stream to both, verify identical output
+        let stream: Vec<u8> = (0..100).map(|i| (i % 5) as u8).collect();
+        for &b in &stream {
+            let p1 = pred.predict();
+            let p2 = fresh.predict();
+            assert_eq!(p1, p2, "Prediction diverged after reset at step {}", pred.step);
+            pred.update(b);
+            fresh.update(b);
+        }
+    }
+
+    #[test]
+    fn reset_prediction_equivalence() {
+        // Full roundtrip: train, reset, retrain — must match fresh predictor
+        let stream: Vec<u8> = (0..150).map(|i| (i * 13 + 7) as u8).collect();
+
+        let mut pred = NeuralSsmPredictor::new();
+        for &b in &stream {
+            pred.predict();
+            pred.update(b);
+        }
+        pred.reset();
+
+        let mut fresh = NeuralSsmPredictor::new();
+        for &b in &stream {
+            let p1 = pred.predict();
+            let p2 = fresh.predict();
+            assert_eq!(p1, p2, "Predictions must match after reset");
+            pred.update(b);
+            fresh.update(b);
+        }
     }
 
     /// Measure cross-entropy (bits per byte) of a predictor on given data.
