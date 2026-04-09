@@ -10,8 +10,8 @@ use crate::format::shannon_entropy;
 pub const MIN_CHUNK_SIZE: u32 = 16 * 1024;
 /// Average chunk size (512 KiB).
 pub const AVG_CHUNK_SIZE: u32 = 512 * 1024;
-/// Maximum chunk size (4 MiB).
-pub const MAX_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+/// Maximum chunk size (8 MiB).
+pub const MAX_CHUNK_SIZE: u32 = 8 * 1024 * 1024;
 
 /// A content-defined chunk with precomputed metadata.
 #[derive(Debug)]
