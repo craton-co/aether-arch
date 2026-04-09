@@ -36,9 +36,9 @@ const MAX_BWT_DECODE_SIZE: usize = crate::format::MAX_DECOMPRESSED_BLOCK_SIZE;
 /// compressed in parallel (one rayon task per group), limiting BWT input
 /// prevents OOM on memory-constrained targets.
 ///
-/// The maximum FastCDC chunk size is 4 MiB (`MAX_CHUNK_SIZE`), so this
-/// constant provides a 2× safety margin.  If chunk sizes are increased in
-/// the future, this constant should be updated to match.
+/// The maximum FastCDC chunk size is 8 MiB (`MAX_CHUNK_SIZE`), matching
+/// this limit exactly.  The BWT guard uses strict greater-than (`>`), so
+/// chunks of exactly 8 MiB are accepted.
 pub const MAX_BWT_INPUT_SIZE: usize = 8 * 1024 * 1024;
 
 // ── BWT (Burrows-Wheeler Transform) ─────────────────────────────────────────
