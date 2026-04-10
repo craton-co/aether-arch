@@ -112,10 +112,11 @@ pub fn compress_chunk(
             // Skip BWT for high-entropy chunks — suffix array construction
             // is expensive and BWT clustering provides minimal benefit on
             // near-random data.  Text is typically 4-5 bps.
-            // 7.0 bps is conservative: preserves ratio on Silesia while
-            // still skipping truly incompressible chunks (6.5 caused 0.84%
-            // ratio regression on Silesia by skipping BWT-beneficial chunks).
-            const BWT_ENTROPY_SKIP: f64 = 7.0;
+            // 6.5 bps: skip BWT for chunks unlikely to benefit from
+            // context clustering.  Data in the 6.5-7.0 range is rarely
+            // structured enough for BWT to beat LZ77/plain RC, and skipping
+            // the expensive SA construction yields a significant speed gain.
+            const BWT_ENTROPY_SKIP: f64 = 6.5;
             if chunk.data.len() >= 8 && chunk.entropy < BWT_ENTROPY_SKIP {
                 if let Ok((primary_index, mtf_data)) =
                     bwt_preprocess::bwt_mtf_encode_parts(&chunk.data)
