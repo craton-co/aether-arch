@@ -39,11 +39,12 @@ struct CompressedFileBlocks {
 /// limits how many groups are compressed concurrently, capping peak
 /// memory at roughly `max_threads × (predictor_size + group_data)`.
 ///
-/// Default is 4 concurrent groups. Use [`Compressor::with_max_threads`]
-/// to tune for available memory:
+/// Default is dynamic: `available_cores / 2`, with fallback to 4.
+/// This balances parallelism with memory usage across different system configurations.
+/// Use [`Compressor::with_max_threads`] to override:
 /// - Low memory (< 2 GiB): `max_threads = 1-2`
-/// - Default (2-8 GiB): `max_threads = 4`
-/// - High memory (> 8 GiB): `max_threads = 8+` or `0` for unlimited
+/// - Medium memory (2-8 GiB): use default (automatic)
+/// - High memory (> 8 GiB): `max_threads = available_cores / 2` or `available_cores - 1` for max
 ///
 /// Encryption configuration for the compressor (enterprise feature).
 ///
@@ -68,8 +69,35 @@ pub struct Compressor {
     dictionary: Option<crate::dictionary::Dictionary>,
 }
 
-/// Default maximum concurrent groups for memory backpressure.
-const DEFAULT_MAX_THREADS: usize = 4;
+/// Calculate default maximum concurrent compression threads based on available CPU cores.
+///
+/// Uses `available_parallelism() / 2` to balance parallelism with memory backpressure.
+/// - 1-2 cores: use 1 thread
+/// - 4 cores: use 2 threads
+/// - 8 cores: use 4 threads
+/// - 16 cores: use 8 threads
+/// - 32+ cores: use available - 1 (up to CPU count)
+///
+/// This allows multi-core systems to utilize more parallelism while preventing
+/// OOM on systems with limited memory.
+pub fn default_max_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| {
+            let cores = count.get();
+            // Use available_cores / 2 for default, or at least 1
+            (cores / 2).max(1)
+        })
+        .unwrap_or(4) // Fallback to 4 if available_parallelism fails
+}
+
+/// Maximum possible threads (all available CPU cores minus 1, for system responsiveness).
+/// This can be used by CLI or higher-level APIs to validate user-provided thread counts.
+#[allow(dead_code)]
+pub fn max_possible_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| (count.get() - 1).max(1))
+        .unwrap_or(32) // Conservative fallback if detection fails
+}
 
 impl Compressor {
     /// Create a new compressor with the given predictor factory.
@@ -78,7 +106,7 @@ impl Compressor {
     /// It must be `Send + Sync` so it can be shared across rayon worker threads
     /// for parallel group compression.
     ///
-    /// Uses `DEFAULT_MAX_THREADS` (4) concurrent groups by default.
+    /// Uses dynamic `default_max_threads()` concurrent groups based on available CPU cores.
     pub fn new<F>(factory: F) -> Self
     where
         F: Fn() -> Box<dyn ProbabilityPredictor> + Send + Sync + 'static,
@@ -88,7 +116,7 @@ impl Compressor {
         Self {
             predictor_factory: Box::new(factory),
             predictor_id: pid,
-            max_threads: DEFAULT_MAX_THREADS,
+            max_threads: default_max_threads(),
             #[cfg(feature = "enterprise")]
             encryption_config: None,
             dictionary: None,
