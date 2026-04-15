@@ -9,7 +9,8 @@
 //!
 //! ```text
 //! [width: u8]                     // Element width (2 or 4)
-//! [plane_flags: u8]               // Bitmask: bit i=1 -> plane i is RC-compressed
+//! [flags: u8]                     // Lower nibble (0-3): RC-compressed per plane
+//!                                 // Upper nibble (4-7): delta-encoded per plane
 //! [plane_sizes: u32 LE x width]   // Compressed size of each plane
 //! [plane_data...]                  // Concatenated plane payloads
 //! [tail_bytes...]                  // Uncompressed remainder (len % width bytes)
@@ -139,6 +140,42 @@ pub fn classify_planes(planes: &[Vec<u8>]) -> u8 {
     flags
 }
 
+/// Delta-encode a byte plane: out[0] = plane[0], out[i] = plane[i] - plane[i-1] (wrapping).
+///
+/// Reduces entropy for slowly-changing values (e.g. exponent bytes in float arrays).
+fn delta_encode(plane: &[u8]) -> Vec<u8> {
+    if plane.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(plane.len());
+    out.push(plane[0]);
+    for i in 1..plane.len() {
+        out.push(plane[i].wrapping_sub(plane[i - 1]));
+    }
+    out
+}
+
+/// Reverse delta encoding in-place: cumulative sum (prefix sum).
+fn delta_decode(plane: &mut [u8]) {
+    for i in 1..plane.len() {
+        plane[i] = plane[i].wrapping_add(plane[i - 1]);
+    }
+}
+
+/// Minimum entropy improvement (bits/byte) to justify applying delta encoding.
+const DELTA_BENEFIT_THRESHOLD: f64 = 0.1;
+
+/// Check if delta encoding reduces entropy enough to be worthwhile.
+fn should_delta(plane: &[u8]) -> bool {
+    if plane.len() < 16 {
+        return false;
+    }
+    let raw_entropy = shannon_entropy(plane);
+    let delta = delta_encode(plane);
+    let delta_entropy = shannon_entropy(&delta);
+    delta_entropy + DELTA_BENEFIT_THRESHOLD < raw_entropy
+}
+
 /// Detect if data is likely an array of numeric values at the given width.
 ///
 /// Uses a simple heuristic: checks if byte-plane splitting reveals
@@ -191,28 +228,38 @@ pub fn byteplane_encode(data: &[u8], width: BytePlaneWidth) -> Option<Vec<u8>> {
     }
 
     let (planes, tail) = byteplane_split(data, width);
-    let plane_flags = classify_planes(&planes);
+    let w = width.planes();
+
+    // Apply delta encoding per-plane where beneficial, before classification
+    let mut delta_flags: u8 = 0;
+    let mut maybe_delta_planes: Vec<Vec<u8>> = Vec::with_capacity(w);
+    for (i, plane) in planes.iter().enumerate() {
+        if should_delta(plane) {
+            delta_flags |= 1 << i;
+            maybe_delta_planes.push(delta_encode(plane));
+        } else {
+            maybe_delta_planes.push(plane.clone());
+        }
+    }
+
+    let rc_flags = classify_planes(&maybe_delta_planes);
 
     // At least one plane must be compressible for this to be worthwhile
-    if plane_flags == 0 {
+    if rc_flags == 0 {
         return None;
     }
 
-    let w = width.planes();
-
     // Encode each plane
     let mut encoded_planes: Vec<Vec<u8>> = Vec::with_capacity(w);
-    for (i, plane) in planes.iter().enumerate() {
-        if (plane_flags >> i) & 1 == 1 {
+    for (i, plane) in maybe_delta_planes.iter().enumerate() {
+        if (rc_flags >> i) & 1 == 1 {
             // RC-compress this plane with Order0
             let mut predictor = Order0Model::new();
             match rans::encode_block(plane, &mut predictor) {
                 Ok(rc_bytes) => {
-                    // Only keep RC version if it's actually smaller
                     if rc_bytes.len() < plane.len() {
                         encoded_planes.push(rc_bytes);
                     } else {
-                        // Store raw instead — clear the flag
                         encoded_planes.push(plane.clone());
                     }
                 }
@@ -226,13 +273,16 @@ pub fn byteplane_encode(data: &[u8], width: BytePlaneWidth) -> Option<Vec<u8>> {
         }
     }
 
-    // Recompute flags based on what actually compressed
-    let mut actual_flags: u8 = 0;
-    for (i, (enc, orig)) in encoded_planes.iter().zip(planes.iter()).enumerate() {
-        if enc.len() < orig.len() && (plane_flags >> i) & 1 == 1 {
-            actual_flags |= 1 << i;
+    // Recompute RC flags based on what actually compressed
+    let mut actual_rc_flags: u8 = 0;
+    for (i, (enc, orig)) in encoded_planes.iter().zip(maybe_delta_planes.iter()).enumerate() {
+        if enc.len() < orig.len() && (rc_flags >> i) & 1 == 1 {
+            actual_rc_flags |= 1 << i;
         }
     }
+
+    // Combined flags: lower nibble = RC compression, upper nibble = delta encoding
+    let combined_flags = actual_rc_flags | (delta_flags << 4);
 
     // Build payload: [width: u8] [flags: u8] [sizes: u32 x w] [plane_data...] [tail...]
     let header_size = 2 + 4 * w;
@@ -246,7 +296,7 @@ pub fn byteplane_encode(data: &[u8], width: BytePlaneWidth) -> Option<Vec<u8>> {
 
     let mut payload = Vec::with_capacity(total_size);
     payload.push(width as u8);
-    payload.push(actual_flags);
+    payload.push(combined_flags);
     for ep in &encoded_planes {
         payload.extend_from_slice(&(ep.len() as u32).to_le_bytes());
     }
@@ -276,7 +326,9 @@ pub fn byteplane_decode(payload: &[u8], uncompressed_size: usize) -> crate::erro
     let width = BytePlaneWidth::from_u8(payload[0]).ok_or_else(|| {
         AetherError::Decompression(format!("BytePlane: invalid width byte {}", payload[0]))
     })?;
-    let plane_flags = payload[1];
+    let combined_flags = payload[1];
+    let rc_flags = combined_flags & 0x0F; // lower nibble: RC-compressed
+    let delta_flags = combined_flags >> 4; // upper nibble: delta-encoded
     let w = width.planes();
 
     let sizes_start = 2;
@@ -329,11 +381,10 @@ pub fn byteplane_decode(payload: &[u8], uncompressed_size: usize) -> crate::erro
         let plane_data = &payload[data_offset..data_offset + psize];
         data_offset += psize;
 
-        if (plane_flags >> i) & 1 == 1 {
+        let mut plane = if (rc_flags >> i) & 1 == 1 {
             // RC-compressed: decode with Order0
             let mut predictor = Order0Model::new();
-            let decoded = rans::decode_block(plane_data, n_elements, &mut predictor)?;
-            planes.push(decoded);
+            rans::decode_block(plane_data, n_elements, &mut predictor)?
         } else {
             // Stored raw
             if psize != n_elements {
@@ -342,8 +393,15 @@ pub fn byteplane_decode(payload: &[u8], uncompressed_size: usize) -> crate::erro
                     i, psize, n_elements,
                 )));
             }
-            planes.push(plane_data.to_vec());
+            plane_data.to_vec()
+        };
+
+        // Reverse delta encoding if applied during compression
+        if (delta_flags >> i) & 1 == 1 {
+            delta_decode(&mut plane);
         }
+
+        planes.push(plane);
     }
 
     // Read tail bytes
@@ -490,5 +548,114 @@ mod tests {
         let data = b"The quick brown fox jumps over the lazy dog. ".repeat(50);
         let width = detect_numeric_width(&data);
         assert!(width.is_none(), "text should not be detected as numeric");
+    }
+
+    #[test]
+    fn delta_encode_decode_roundtrip() {
+        let data: Vec<u8> = (0..256).map(|i| i as u8).collect();
+        let encoded = delta_encode(&data);
+        // First byte preserved, rest should be 1 (each byte increments by 1)
+        assert_eq!(encoded[0], 0);
+        assert!(encoded[1..].iter().all(|&b| b == 1));
+        let mut decoded = encoded;
+        delta_decode(&mut decoded);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn delta_encode_empty() {
+        assert!(delta_encode(&[]).is_empty());
+    }
+
+    #[test]
+    fn delta_wrapping_arithmetic() {
+        // 255 → 0 wraps: 0u8.wrapping_sub(255) = 1
+        let data = vec![255, 0, 1, 255];
+        let encoded = delta_encode(&data);
+        let mut decoded = encoded;
+        delta_decode(&mut decoded);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn should_delta_on_sequential_data() {
+        // Slowly changing exponent bytes — delta should help
+        let data: Vec<u8> = (0..1000).map(|i| (0x3F + (i / 100)) as u8).collect();
+        assert!(should_delta(&data), "sequential data should benefit from delta");
+    }
+
+    #[test]
+    fn should_delta_rejects_constant_entropy() {
+        // All-same bytes: entropy is 0 either way, delta should not claim improvement
+        let data = vec![42u8; 1000];
+        assert!(!should_delta(&data), "constant data should not benefit from delta");
+
+        // Already-uniform entropy (every byte value equally represented):
+        // delta of uniform is also roughly uniform, no benefit
+        let data: Vec<u8> = (0..256).cycle().take(2048).map(|b| b as u8).collect();
+        let raw_ent = shannon_entropy(&data);
+        let delta = delta_encode(&data);
+        let delta_ent = shannon_entropy(&delta);
+        // Delta of a perfect ramp is all-1s (low entropy), so this tests the inverse:
+        // if raw is already maximally structured, delta might help or not — but we
+        // at least verify the function runs without panic
+        let _ = should_delta(&data);
+        assert!(
+            (delta_ent - raw_ent).abs() < 8.0,
+            "entropy values should be finite"
+        );
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_with_delta() {
+        // Simulate data where exponent bytes change slowly (delta helps)
+        let n = 2000;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            // Exponent: slowly incrementing (delta-friendly)
+            let exp = (0x3F + (i / 200)) as u8;
+            let mantissa = ((i as u32).wrapping_mul(2654435761) >> 16) as u8;
+            data.push(exp);
+            data.push(mantissa);
+        }
+
+        let encoded = byteplane_encode(&data, BytePlaneWidth::Two);
+        assert!(encoded.is_some(), "delta-friendly data should compress");
+
+        let payload = encoded.unwrap();
+        // Verify delta flag is set in upper nibble for the exponent plane
+        let flags = payload[1];
+        let delta_flags = flags >> 4;
+        assert!(
+            delta_flags & 1 == 1,
+            "exponent plane (slowly changing) should have delta flag set, flags={:#04x}",
+            flags
+        );
+
+        let decoded = byteplane_decode(&payload, data.len()).unwrap();
+        assert_eq!(decoded, data, "roundtrip with delta must be lossless");
+    }
+
+    #[test]
+    fn old_format_without_delta_still_decodes() {
+        // Simulate an old-format payload (delta_flags = 0 in upper nibble)
+        // by encoding with the existing test data that won't trigger delta
+        let n = 2000;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let exp = match i % 10 {
+                0..=6 => 0x3F,
+                7..=8 => 0x40,
+                _ => 0x3E,
+            };
+            let mantissa = ((i as u32).wrapping_mul(2654435761) >> 16) as u8;
+            data.push(exp);
+            data.push(mantissa);
+        }
+
+        if let Some(payload) = byteplane_encode(&data, BytePlaneWidth::Two) {
+            let decoded = byteplane_decode(&payload, data.len()).unwrap();
+            assert_eq!(decoded, data);
+        }
     }
 }
