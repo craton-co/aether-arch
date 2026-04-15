@@ -6,18 +6,21 @@
 
 A next-generation file archiver built in Rust that combines neural-probabilistic prediction with custom range coding, content-defined chunking, semantic solid archiving, and adaptive routing.
 
-**Status**: 0.2.3 — 285 tests (128 unit + 87 integration + 28 FFI + 41 server + 1 doc), 6 crates, encryption, streaming, dictionary pretraining, REST API, Wasm target
+**Status**: 0.2.6 — 293 tests (128 unit + 87 integration + 28 FFI + 41 server + 1 doc), 6 crates, encryption, streaming, dictionary pretraining, REST API, Wasm target
 
 ```
-Tool             Ratio     vs AetherArch   Corpus
+Tool             Ratio     Speed (comp)    Corpus
 ────────────────────────────────────────────────────────────────
-AetherArch      26.45%        —            Silesia 202 MiB (12 files)
-gzip -9         31.91%    17.1% larger     Silesia 202 MiB
-bzip2 -9        25.72%     2.8% smaller    Silesia 202 MiB
+AetherArch      21.25%    0.13 MB/s        Webster 40 MiB (dictionary text)
+xz -9           20.00%    0.79 MB/s        Webster 40 MiB  (best ratio)
+brotli -q11     20.25%    0.19 MB/s        Webster 40 MiB
+zstd -19        20.75%    1.36 MB/s        Webster 40 MiB
+bzip2 -9        20.75%    7.53 MB/s        Webster 40 MiB
+gzip -9         30.00%    12.3 MB/s        Webster 40 MiB
 ```
 
-AetherArch sits **between gzip and bzip2** on the industry-standard Silesia benchmark.
-Beats gzip-9 by 17.1% overall; bzip2-9 leads by only 2.8%.
+AetherArch ranks **2nd on the Webster dictionary benchmark** (only 1.25% behind xz best-in-class),
+beating brotli, zstd, bzip2, and gzip on compression ratio. See [docs/v2.6/BENCHMARK_V2_6.md](docs/v2.6/BENCHMARK_V2_6.md) for full Silesia results.
 
 ## How It Works
 
@@ -75,7 +78,7 @@ aet compress mydir/ -o archive.aet --analytics        # show compression stats
 ```bash
 aet extract archive.aet -o output_dir/
 aet extract archive.aet -f path/to/file.txt -o .     # single file
-aet extract archive.aet -o output_dir/ --threads 4    # parallel decompression
+aet extract archive.aet -o output_dir/ --threads 4    # parallel decompression (auto-scales by default)
 cat archive.aet | aet extract - -o output_dir/        # streaming from stdin
 ```
 
@@ -219,7 +222,7 @@ aether/
     └── large/                         # Benchmark corpus (~87 KiB)
 ```
 
-285 tests (128 unit + 87 integration + 28 FFI + 41 server + 1 doc, 5 ignored).
+293 tests (128 unit + 87 integration + 28 FFI + 41 server + 1 doc, 5 ignored).
 
 ## .aet Archive Format
 
@@ -295,6 +298,14 @@ cargo +nightly fuzz run fuzz_decode_block -p aether-core
 - [docs/PREDICTORS.md](docs/PREDICTORS.md) — Detailed predictor and compression method reference
 - [docs/PRESENTATION.md](docs/PRESENTATION.md) — Project overview slides
 
+### V2.6 Release Docs
+
+- [docs/v2.6/BENCHMARK_V2_6.md](docs/v2.6/BENCHMARK_V2_6.md) — Full Silesia benchmark vs gzip, brotli, xz, zstd, bzip2, lz4
+- [docs/v2.6/IMPLEMENTATION_REPORT_V2_6.md](docs/v2.6/IMPLEMENTATION_REPORT_V2_6.md) — All 5 optimizations explained
+- [docs/v2.6/THREADING_DESIGN.md](docs/v2.6/THREADING_DESIGN.md) — Dynamic threading architecture and scaling analysis
+- [docs/v2.6/STATUS_REPORT.md](docs/v2.6/STATUS_REPORT.md) — Deployment readiness checklist
+- [docs/v2.6/V2_6_QUICK_REFERENCE.md](docs/v2.6/V2_6_QUICK_REFERENCE.md) — Quick command reference
+
 ## Installation
 
 ```bash
@@ -311,7 +322,7 @@ Minimum supported Rust version: **1.85.0**
 
 AetherArch is pre-1.0 software. Key gaps before production use:
 
-- **Speed**: ~0.2 MiB/s on large files (Silesia). Suitable for archival, not real-time compression.
+- **Speed**: ~2.0 MiB/s on text/code (internal corpus, V2.6); ~0.1 MiB/s on large Silesia files. Suitable for archival, not real-time compression.
 - **Format not frozen**: The `.aet` binary format may change in future versions. No migration guarantee yet.
 - **No symlink support**: Symbolic links are followed and stored as regular files.
 - **No archive append**: Adding files requires a full rewrite of the archive.

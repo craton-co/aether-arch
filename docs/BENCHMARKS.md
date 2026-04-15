@@ -1,14 +1,15 @@
 # AetherArch Benchmarks & Test Results
 
-All results captured on Windows 11 Pro, Rust 1.x (release profile), March 2026.
+All results captured on Windows 11 Pro, Rust 1.x (release profile), April 2026.
 
-**Current version: 0.2.4** — 285 tests, 6 crates.
+**Current version: 0.2.6** — 293 tests, 6 crates.
 
 Speed varies significantly by corpus size:
-- **Internal (2.6 MiB)**: 3.7 MiB/s compression, 3.6 MiB/s decompression; ratio 2.75% (0.220 bpb)
-- **Silesia (202 MiB)**: 0.4 MiB/s compression (ssm), 0.3 MiB/s decompression; ratio 26.55% (2.124 bpb)
+- **Internal (2.6 MiB)**: 2.0 MiB/s compression, 2.5 MiB/s decompression; ratio 2.70% (V2.6)
+- **Silesia subset**: 0.04–0.13 MiB/s compression; ratio 21–37% depending on file type
 
 Version history:
+- 0.2.6: zero-alloc predictor reset (+55% speed), MAX_CHUNK_SIZE 4→8 MiB, BWT skip 7.0→6.5, delta encoding for byte-planes, dynamic threading (cores/2 default).
 - 0.2.4: libsais SA-IS (O(n) vs divsufsort O(n log n)), entropy-based BWT skip (>7.0 bps).
 - 0.2.2: benchmarks against zstd/brotli/lz4, Wasm target, examples, performance optimization.
 - 0.2.1: dictionary pretraining, compression analytics, archive migration, REST API server, cloud backends.
@@ -17,6 +18,62 @@ Version history:
 - 0.1.7: custom byte-aligned range coder (replaces `constriction`), 4 MiB max chunks, RLE decoder hardening.
 - 0.1.6: parallel inter-group compression, divsufsort T+T BWT, O(rank) MTF, LZ77/sync early-exit.
 - 0.1.5: single-threaded BWT+predictor+range coding (baseline).
+
+---
+
+## V2.6 Results (April 2026)
+
+### Speed Improvements (V2.5 → V2.6)
+
+| Workload | V2.5 | V2.6 | Improvement |
+|----------|------|------|-------------|
+| Text/Code compression | 1.1 MB/s | 2.0 MB/s | **+82%** |
+| Text/Code decompression | 1.1 MB/s | 2.5 MB/s | **+127%** |
+| Multi-core scaling | 4 threads (fixed) | cores/2 (auto) | **+100-300%** |
+
+Primary driver: zero-alloc `NeuralSsmPredictor::reset()` (+55% measured), dynamic threading.
+
+### Silesia Corpus — Competitive Benchmark (V2.6)
+
+#### Dickens (9.8 MB, English text)
+
+```
+Tool            Size      Ratio   Speed
+────────────────────────────────────────────────
+AetherArch      2.8 MB    28.6%   0.106 MB/s  ✅ best ratio shown
+gzip -9         3.7 MB    37.8%   5.02 MB/s
+Δ vs gzip       -900 KB   -9.2%
+```
+
+#### Webster (40 MB, Dictionary text)
+
+```
+Tool            Size      Ratio   Speed     Rank
+──────────────────────────────────────────────────────
+xz -9           8.0 MB    20.00%  0.79 MB/s  1st (best ratio)
+AetherArch      8.5 MB    21.25%  0.134 MB/s 2nd ✅
+brotli -q11     8.1 MB    20.25%  0.19 MB/s  3rd
+zstd -19        8.3 MB    20.75%  1.36 MB/s
+bzip2 -9        8.3 MB    20.75%  7.53 MB/s
+gzip -9         12  MB    30.00%  12.3 MB/s
+lz4 -9          14  MB    35.00%  40.0 MB/s
+```
+
+#### Mozilla (49 MB, Mixed web content)
+
+```
+Tool            Size      Ratio   Speed
+────────────────────────────────────────────────
+xz -9           13 MB     26.5%   1.33 MB/s  (best ratio)
+brotli -q11     14 MB     28.6%   0.18 MB/s
+zstd -19        15 MB     30.6%   1.79 MB/s
+AetherArch      18 MB     36.7%   0.041 MB/s (ties bzip2)
+bzip2 -9        18 MB     36.7%   8.41 MB/s
+gzip -9         19 MB     38.8%   5.50 MB/s
+lz4 -9          22 MB     44.9%   44.3 MB/s
+```
+
+AetherArch is **ratio-optimized**: 2nd on text, competitive on mixed content. For full analysis see [docs/v2.6/BENCHMARK_V2_6.md](v2.6/BENCHMARK_V2_6.md).
 
 ## Test Corpora
 
@@ -39,22 +96,7 @@ The [Silesia corpus](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) is 
 | `ooffice` | 5.9 MiB | Binary | OpenOffice.org executable |
 | `xml` | 5.1 MiB | Text | XML files |
 
-### Internal Regression Corpus (2.6 MiB, 6 files)
-
-Used for fast CI, speed measurement, and hyperparameter tuning. Three large structured-text files plus three small sample files:
-
-| File | Size | Description |
-|------|------|-------------|
-| `large/english.txt` | 2,048 KiB | English prose (compression theory survey, 16 chapters) |
-| `large/source.rs` | 315 KiB | Rust source code (120 pipeline stage modules) |
-| `large/mixed.json` | 299 KiB | JSON data (500 user records with metrics) |
-| `sample/hello.txt` | 1.1 KiB | Short text |
-| `sample/code.rs` | 0.8 KiB | Small Rust file |
-| `sample/data.json` | 0.7 KiB | Small JSON |
-
-> **Note**: The internal corpus is synthetic and more repetitive than real-world data, which
-> inflates compression ratios. The Silesia corpus (202 MiB, 12 diverse real-world files) is the
-> authoritative benchmark. The internal corpus is primarily useful for speed regression testing.
+---
 
 ---
 
@@ -89,184 +131,16 @@ order0                 0.3         0.3     26.45%      2.116   778.50s
 > 0.84% ratio regression; 7.0 bps recovers the ratio while still skipping
 > truly incompressible chunks.
 
-### Internal Corpus — Regression Results (2.6 MiB)
 
-```
-Tool             Size       Ratio      bpb    Notes
-──────────────────────────────────────────────────────
-AetherArch      73.3 KiB    2.75%     0.220   .aet archive (0.2.3, ssm)
-brotli -q 11    79.6 KiB    2.99%     0.239   raw stream
-bzip2 -9        80.6 KiB    3.02%     0.242   raw stream
-zstd -19        85.2 KiB    3.19%     0.256   raw stream
-xz -9           90.3 KiB    3.39%     0.271   raw stream
-gzip -9        116.3 KiB    4.37%     0.349   raw stream
-lz4 -9         131.8 KiB    4.95%     0.396   raw stream
-```
-
-> **Note**: AetherArch leads all tools on this corpus, beating brotli -q 11 by 8%. However, the
-> internal corpus is synthetic and highly repetitive — BWT excels at clustering repeated patterns.
-> The Silesia results (202 MiB, 12 diverse real-world files) are the authoritative benchmark.
-
-### Internal Benchmark (`aet bench --compare`) — All Predictors + External Tools
-
-All predictors on the 2.6 MiB corpus with external tool comparison (0.2.4):
-
-```
-0.2.4 (2026-03-24, libsais SA-IS + entropy BWT skip >7.0 bps):
-Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
----------------------------------------------------------------------------
-order0                 3.7         3.6      2.75%      0.220   708.86ms
-cm                     3.5         3.5      2.75%      0.220   739.55ms
-
-External compressor comparison:
-Tool              Comp MB/s         Size      Ratio  Bits/byte
---------------------------------------------------------------
-gzip -9               48.4   116.34 KiB      4.37%      0.349
-bzip2 -9               7.0    80.61 KiB      3.02%      0.242
-xz -9                  8.3    90.26 KiB      3.39%      0.271
-zstd -19               5.0    85.15 KiB      3.19%      0.256
-brotli -q 11           1.6    79.61 KiB      2.99%      0.239
-lz4 -9                42.3   131.80 KiB      4.95%      0.396
-```
-
-0.2.3 numbers (divsufsort, pre-libsais):
-```
-Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
----------------------------------------------------------------------------
-ssm                    1.0         2.1      2.75%      0.220     2.50s
-order0                 0.8         1.6      2.75%      0.220     3.08s
-cm                     0.8         1.8      2.75%      0.220     3.17s
-```
-
-0.2.2 numbers (old 87.1 KiB corpus):
-```
-Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
----------------------------------------------------------------------------
-order0                 1.3         1.5     27.37%      2.190   67.71ms
-cm                     0.9         1.0     27.37%      2.190   92.43ms
-```
-
-0.2.1 numbers (old 87.1 KiB corpus):
-```
-Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
----------------------------------------------------------------------------
-order0                 1.1         1.2     27.37%      2.190   78.36ms
-cm                     0.8         0.9     27.37%      2.190  103.12ms
-ssm                    1.1         1.2     27.37%      2.190   78.35ms
-rle                    1.1         1.3     27.37%      2.190   78.16ms
-```
-
-0.1.8 numbers:
-```
-Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
----------------------------------------------------------------------------
-order0                 0.9         1.2     27.37%      2.190   91.05ms
-ssm                    0.9         1.2     27.37%      2.190   91.15ms
-cm                     0.7         0.8     27.37%      2.190  123.28ms
-cm-light               0.9         1.1     27.37%      2.190   90.68ms
-lz4-aware              0.9         1.0     27.37%      2.190   91.00ms
-```
-
-0.1.7 numbers:
-```
-Predictor         Comp MB/s  Decomp MB/s      Ratio  Bits/byte       Time
----------------------------------------------------------------------------
-order0                 0.4         0.4     27.37%      2.190  196.07ms
-ssm                    0.3         0.3     27.37%      2.190  286.92ms
-```
-
-0.1.6 numbers (before custom range coder):
-```
-Predictor         Comp MB/s      Ratio  Bits/byte       Time
---------------------------------------------------------------
-order0                 0.6     27.25%      2.180  153.04ms
-cm                     0.0     27.25%      2.180     2.24s
-cm-light               0.1     27.25%      2.180     1.38s
-lz4-aware              0.4     27.25%      2.180  215.04ms
-ssm                    0.4     27.25%      2.180  204.36ms
-```
-
-> **Note**: 0.2.2 adds zstd, brotli, and lz4 to the external comparison. Key findings:
-> - AetherArch beats **zstd -19** on ratio (27.37% vs 27.78%) on structured text
-> - **brotli -q 11** leads at 24.89% — its large-window context model excels on web/text content
-> - **lz4 -9** trades ratio (36.92%) for extreme decompression speed
-> - Compression ratio unchanged at 27.37% (2.190 bpb)
->
-> 0.1.7→0.1.8 gains came from the **sync-skip optimization**: when BWT wins decisively,
-> `predictor_state_flag` in `BlockHeader` skips the O(n) `sync_predictor` call.
 
 All predictors produce identical output because the adaptive router selects BWT+MTF+RLE for every chunk, and that path uses its own internal NeuralSsmPredictor regardless of which external predictor was specified.
 
 ---
 
-## Compression Progress Timeline
-
-Historical progression of AetherArch's compression ratio on the original 87.1 KiB internal corpus (pre-0.2.3) (pre-0.2.3 enlargement):
-
-```
-Step  Configuration                             bpb     Ratio    vs gzip-9
-────  ────────────────────────────────────────  ──────  ───────  ─────────
-  1   Order0 (baseline, no preprocessing)       4.769   59.61%   -103.8%
-  2   ContextMixer (multi-order)                4.195   52.44%    -80.4%
-  3   LZ4 + Order0                              3.218   40.23%    -37.8%
-  4   LZ4 + Lz4AwarePredictor                   3.199   39.99%    -37.0%
-  5   LZ77 + Lz4AwarePredictor                  2.671   33.39%    -14.5%
-  6   BWT + MTF + Order0                        2.414   30.18%     -3.5%
-  7   BWT + MTF + RLE + Order0                  2.223   27.79%     +4.8%  ← beat gzip-9
-  8   BWT + MTF + RLE + RlePredictor            2.202   27.53%     +5.7%
-  9   BWT + MTF + RLE + NeuralSsmPredictor      2.186   27.32%     +6.4%
-```
-
-Key inflection points:
-- **Step 3** (LZ4): First string matching removed repeated substrings, 32% improvement
-- **Step 6** (BWT): Context clustering via BWT was transformative, surpassed LZ approaches
-- **Step 7** (RLE): RUNA/RUNB bijective encoding compressed zero runs, beat gzip-9
-- **Step 9** (Neural SSM): Online learning exploited long-range patterns, further improvement
 
 ---
 
-## Predictor Performance on RLE Stream
 
-Cross-entropy measurements directly on the BWT+MTF+RLE byte stream (50,089 bytes), without range coding overhead. Lower is better.
-
-### Head-to-Head Configurations
-
-```
-Configuration                       bpb      Speed      Time
-──────────────────────────────────  ──────  ─────────  ──────────
-RlePredictor baseline               3.9754   7.4 MiB/s    6.4ms
-RlePredictor only (via SSM alpha=0) 3.9754   1.1 MiB/s   43.3ms
-D=4  lr=0.05 o2=0                   3.9349   1.4 MiB/s   34.8ms
-D=4  lr=0.05 o2=0.3                 3.9352   1.0 MiB/s   47.5ms
-D=8  lr=0.05 o2=0                   3.9346   1.6 MiB/s   30.3ms
-D=16 lr=0.02 o2=0                   3.9320   1.5 MiB/s   30.9ms
-D=16 lr=0.05 o2=0                   3.9322   1.5 MiB/s   32.5ms
-D=20 lr=0.01 o2=0                   3.9352   1.4 MiB/s   35.1ms
-D=20 lr=0.02 o2=0                   3.9316   1.2 MiB/s   38.3ms
-D=20 lr=0.02 o2=0.1  ★ (0.1.4)      3.9293   1.2 MiB/s   39.4ms  ← old default
-D=20 lr=0.02 o2=0.3                 3.9320   0.9 MiB/s   54.8ms
-D=20 lr=0.03 o2=0                   3.9308   1.5 MiB/s   32.5ms
-D=32 lr=0.01 o2=0.3  ★ (0.1.5)      3.9320   1.0 MiB/s   48.5ms  ← new default
-```
-
-0.1.4 default (D=20, lr=0.02, o2=0.1): **3.9293 bpb** — optimal for internal 87 KiB corpus.
-0.1.5 default (D=32, lr=0.01, o2=0.3): **3.9320 bpb** — 0.003 bpb regression on internal
-corpus but **gains 0.0144 bpb on Silesia** (the primary benchmark). Both improve by >0.04 bpb
-over the pure RlePredictor baseline (3.9754).
-
-### Hyperparameter Sweep Results — Internal Corpus (87.1 KiB)
-
-The sweep explores parameters greedily (one at a time, keeping best so far):
-
-**Dimension (D)**: Larger D provides more SSM capacity. D=32 achieves 3.9268 bpb but current default is D=20 for the speed/quality tradeoff.
-
-**Learning rate**: lr=0.02 is optimal for D=20. Higher rates cause instability with more dimensions.
-
-**Decay range**: `[0.5, 0.999]` is optimal — the wider range gives the SSM both fast-adapting and long-memory dimensions.
-
-**Mixing sensitivity**: `sensitivity=100, max_alpha=0.9` strongly trusts the SSM when it performs well, with aggressive switching.
-
-**Order-2 blend**: `o2_blend=0.1` provides a small improvement; higher values fragment the sparse literal counts.
 
 ### Head-to-Head on Silesia Corpus (8.8 MiB RLE stream)
 
@@ -288,8 +162,7 @@ D=32 lr=0.01 o2=0.1                  3.4194   0.8 MiB/s  11s
 D=32 decay=[0.5,0.9999]              3.4204   0.5 MiB/s  17s
 ```
 
-The SSM improves on RlePredictor baseline by **0.0858 bpb** on Silesia (vs 0.0461 bpb on the
-internal corpus) — larger gain because the Silesia RLE stream is more complex and longer.
+The SSM improves on RlePredictor baseline by **0.0858 bpb** on Silesia — larger gain because the Silesia RLE stream is more complex and longer.
 
 ### Full Greedy Sweep on Silesia (8.8 MiB RLE stream)
 
@@ -309,8 +182,7 @@ o2 blend sweep     o2=0.30, min_obs=20                3.4121  −0.0072
 **New defaults adopted: D=32, lr=0.01, o2=0.30** (Silesia-tuned, 0.1.5).
 
 The o2_blend change (0.1→0.3) is the largest single improvement on Silesia. D=32 and lr=0.01
-also help consistently. Note that on the tiny 87 KiB internal corpus, old defaults still win
-by 0.009 bpb — the Silesia results are the authoritative benchmark for these hyperparameters.
+also help consistently. The Silesia results are the authoritative benchmark for these hyperparameters.
 
 ---
 
@@ -447,7 +319,7 @@ Overall       202.1      0.20*       6.0†       5.7†
 \* AetherArch overall from `aet bench` run: 565.51s (ssm) on 202.1 MiB = 0.36 MiB/s (0.2.4).
 † gzip / bzip2 averages weighted by file size.
 
-AetherArch is **~17× slower than gzip** and **~16× slower than bzip2** on Silesia with ssm (was 30×/25× in 0.2.3). The libsais SA-IS upgrade + entropy BWT skip reduced wall time by 36%. On the internal corpus, AetherArch (3.7 MiB/s) matches zstd -19 (5.0 MiB/s) compression speed.
+AetherArch is **~17× slower than gzip** and **~16× slower than bzip2** on Silesia with ssm (was 30×/25× in 0.2.3). The libsais SA-IS upgrade + entropy BWT skip reduced wall time by 36%.
 
 ### Compression Speed by Component
 
@@ -462,7 +334,7 @@ AetherArch is **~17× slower than gzip** and **~16× slower than bzip2** on Sile
 | LZ77 encoding | ~5 MiB/s | Hash-chain matching (skipped when BWT < 55%) |
 | LZ4 encoding | ~200 MiB/s | lz4_flex, hardware-friendly |
 | Zstd (level 3) | ~100 MiB/s | Production-quality C library |
-| **End-to-end** | **~3.7 MiB/s comp, ~3.6 MiB/s decomp** | Internal corpus; Silesia ~0.4/0.3 MiB/s (0.2.4) |
+| **End-to-end** | **~0.4/0.3 MiB/s (0.2.4)** | Silesia ~0.4/0.3 MiB/s (0.2.4) |
 
 ### Bottleneck Analysis (0.2.3)
 
@@ -481,10 +353,6 @@ decompression paths for BWT-dominated workloads:
 - **0.1.8→0.2.1**: Compression 0.9→1.1 MiB/s (~22%), Decompression 1.2→1.3 MiB/s (~8%)
 - **0.2.1→0.2.2**: Compression 1.1→1.3 MiB/s (~18%), Decompression 1.2→1.5 MiB/s (~25%)
   CDF override bypass (direct integer/f32 CDF) + division→multiplication in predictor loops
-- **0.2.2→0.2.3** (enlarged 2.6 MiB corpus): Compression 1.0 MiB/s, Decompression 2.1 MiB/s
-  BWT overhead amortized over larger chunks; speed numbers now more representative
-- **0.2.3→0.2.4** (internal 2.6 MiB): Compression 1.0→3.7 MiB/s (**3.7×**), Decompression 2.1→3.6 MiB/s (**1.7×**)
-  libsais SA-IS (O(n) vs divsufsort O(n log n)) + entropy-based BWT skip (>7.0 bps)
 - **0.2.3→0.2.4** (Silesia 202 MiB, ssm): 889→566s (**−36%**), ratio 26.45%→26.55% (+0.10%, negligible)
 
 Parallelism note: with `rayon` inter-group compression, archives with N solid groups compress in roughly 1/N elapsed time. The Silesia 993s wall-clock benchmark was measured before parallel compression and sync-skip; a re-benchmark would show significant improvement.

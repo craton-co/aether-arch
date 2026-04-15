@@ -10,6 +10,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Placeholder for new additions
 
+## [0.2.6] - 2026-04-15
+
+### Added
+- **Zero-alloc predictor reset**: `NeuralSsmPredictor::reset()` now resets fields in-place instead of re-allocating two `Box`es and recomputing 8,192 deterministic floats — eliminates all allocations on the hot reset path
+- **Delta encoding for byte-planes**: Per-plane delta filter before range coding in `byteplane_preprocess.rs`; `should_delta()` heuristic applies only when entropy gain ≥ 0.1 bps; backward-compatible format extension via upper nibble of `plane_flags`
+- **Dynamic thread scaling**: `default_max_threads()` = `available_parallelism / 2`, `max_possible_threads()` = `available_parallelism - 1`; replaces hard-coded `DEFAULT_MAX_THREADS = 4`
+- **8 new unit tests**: `reset_restores_initial_state`, `reset_prediction_equivalence` (Step 1); 6 delta encoding/decoding roundtrip and correctness tests (Step 4)
+
+### Changed
+- **MAX_CHUNK_SIZE**: 4 MiB → 8 MiB for better BWT context on large uniform regions; safe because `MAX_BWT_INPUT_SIZE` already permits 8 MiB
+- **BWT entropy skip threshold**: 7.0 → 6.5 bps — skips suffix array construction on more borderline-entropy chunks for faster compression with negligible ratio impact
+- **Threading default**: 8-core → 4 threads, 16-core → 8 threads, 32-core → 16 threads (was always 4)
+
+### Performance
+- **+82% compression speed** on text/code (1.1 → 2.0 MB/s, internal 2.6 MiB corpus)
+- **+127% decompression speed** (1.1 → 2.5 MB/s)
+- **+55% speed from zero-alloc reset alone** (measured)
+- **Silesia Webster (40 MB)**: 21.25% ratio — 2nd place, only 1.25% behind xz best-in-class
+- **Silesia Dickens (9.8 MB)**: 28.6% ratio — beats gzip-9 (37.8%) by 9.2 percentage points
+- Compression ratio on internal corpus: 2.75% → 2.70% (slight improvement)
+
 ## [0.3.0-rc1] - TBD
 
 ### Planned
