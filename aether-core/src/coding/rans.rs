@@ -336,7 +336,10 @@ impl<'a> RangeDecoder<'a> {
 /// Returns compressed data as a byte vector.
 /// The predictor is reset at the start, then advanced byte-by-byte.
 #[must_use = "encode_block returns the compressed data; discarding it silently loses the V8 cache overflow error"]
-pub fn encode_block(data: &[u8], predictor: &mut dyn ProbabilityPredictor) -> Result<Vec<u8>> {
+pub fn encode_block<P: ProbabilityPredictor + ?Sized>(
+    data: &[u8],
+    predictor: &mut P,
+) -> Result<Vec<u8>> {
     encode_block_inner(data, predictor, true)
 }
 
@@ -345,16 +348,16 @@ pub fn encode_block(data: &[u8], predictor: &mut dyn ProbabilityPredictor) -> Re
 /// Used for cross-block predictor state carry within a solid group:
 /// blocks 2+ reuse the predictor state from the previous block's
 /// predict/update calls, giving the predictor prior context.
-pub fn encode_block_continuing(
+pub fn encode_block_continuing<P: ProbabilityPredictor + ?Sized>(
     data: &[u8],
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
 ) -> Result<Vec<u8>> {
     encode_block_inner(data, predictor, false)
 }
 
-fn encode_block_inner(
+fn encode_block_inner<P: ProbabilityPredictor + ?Sized>(
     data: &[u8],
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
     reset: bool,
 ) -> Result<Vec<u8>> {
     if data.is_empty() {
@@ -391,10 +394,10 @@ const MAX_DECODE_SIZE: usize = crate::format::MAX_DECOMPRESSED_BLOCK_SIZE;
 ///
 /// `expected_len` must match the original uncompressed length exactly.
 /// The predictor must be the same type that was used for encoding.
-pub fn decode_block(
+pub fn decode_block<P: ProbabilityPredictor + ?Sized>(
     compressed: &[u8],
     expected_len: usize,
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
 ) -> Result<Vec<u8>> {
     decode_block_inner(compressed, expected_len, predictor, true)
 }
@@ -403,18 +406,18 @@ pub fn decode_block(
 ///
 /// Used for cross-block predictor state carry: the predictor continues
 /// from the state left by the previous block's decode+update calls.
-pub fn decode_block_continuing(
+pub fn decode_block_continuing<P: ProbabilityPredictor + ?Sized>(
     compressed: &[u8],
     expected_len: usize,
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
 ) -> Result<Vec<u8>> {
     decode_block_inner(compressed, expected_len, predictor, false)
 }
 
-fn decode_block_inner(
+fn decode_block_inner<P: ProbabilityPredictor + ?Sized>(
     compressed: &[u8],
     expected_len: usize,
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
     reset: bool,
 ) -> Result<Vec<u8>> {
     if expected_len == 0 {
