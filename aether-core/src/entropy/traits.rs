@@ -39,6 +39,32 @@ pub trait ProbabilityPredictor: Send {
         crate::coding::rans::probs_to_cdf(&probs)
     }
 
+    /// Return `(cdf[byte], cdf[byte+1])` — the only two CDF entries the range
+    /// coder needs to encode `byte`.
+    ///
+    /// **Encode-only fast path.** The decoder must scan the full CDF (it has
+    /// a codeword in `[0, PROB_TOTAL)` and must find which symbol's interval
+    /// contains it), so this method is only useful on the compress side.
+    ///
+    /// The default implementation calls [`predict_cdf`](Self::predict_cdf) and
+    /// slices, so existing predictors continue working unchanged. Predictors
+    /// where building the full 257-entry table is expensive (e.g. predictors
+    /// that maintain integer counts or do per-byte mixing) should override
+    /// this for an O(1) or O(symbol_count) fast path that skips materialising
+    /// the 254 entries the encoder never reads.
+    ///
+    /// The contract must match `predict_cdf`: after a `query_cdf(byte)` call,
+    /// the next `update(byte)` must advance state in a way that is
+    /// bit-identical to what `predict_cdf()` + `update(byte)` would produce
+    /// at the corresponding `(cdf[byte], cdf[byte+1])` pair. This is what
+    /// keeps encode/decode in lockstep — the decoder still uses
+    /// `predict_cdf`, so the two paths must agree on the same CDF.
+    fn query_cdf(&mut self, byte: u8) -> (u16, u16) {
+        let cdf = self.predict_cdf();
+        let s = byte as usize;
+        (cdf[s], cdf[s + 1])
+    }
+
     /// Feed a confirmed byte to update internal state.
     ///
     /// Called after encoding (compressor) or decoding (decompressor) each byte.
