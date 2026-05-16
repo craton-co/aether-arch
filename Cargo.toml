@@ -37,3 +37,22 @@ libsais-sys = "0.2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Dedicated profiling profile: release perf + full symbol info for flamegraphs.
+# Don't perturb normal `cargo build --release` output. Use with `--profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
+# Profile-guided optimization (PGO) profile.
+# Inherits release flags but lives in its own target subdir
+# (target/<triple>/release-pgo/) so PGO instrumentation/use artifacts don't
+# poison normal `cargo build --release` outputs. Drive via scripts/pgo.ps1,
+# which wraps `cargo pgo instrument` + a training workload + `cargo pgo optimize`.
+# Do NOT use this profile directly; `cargo build --profile release-pgo` without
+# the wrapper produces a non-PGO build that just lives in the wrong directory.
+[profile.release-pgo]
+inherits = "release"
+lto = "thin"
+codegen-units = 1

@@ -176,9 +176,21 @@ impl RangeEncoder {
     #[inline(always)]
     pub fn encode_cdf(&mut self, symbol: u8, cdf: &[u16; 257]) {
         let s = symbol as usize;
-        let cum = cdf[s] as u32;
-        let freq = (cdf[s + 1] - cdf[s]) as u32;
-        debug_assert!(freq > 0, "zero-frequency symbol {s}");
+        self.encode_interval(cdf[s], cdf[s + 1]);
+    }
+
+    /// Encode a symbol given only its `(cdf_lo, cdf_hi)` interval.
+    ///
+    /// Equivalent to `encode_cdf(symbol, &cdf)` when `cdf_lo == cdf[symbol]`
+    /// and `cdf_hi == cdf[symbol + 1]`, but skips materialising the other
+    /// 255 entries — the encoder never reads them. Paired with
+    /// [`ProbabilityPredictor::query_cdf`](crate::entropy::ProbabilityPredictor::query_cdf)
+    /// in the encode hot loop.
+    #[inline(always)]
+    pub fn encode_interval(&mut self, cdf_lo: u16, cdf_hi: u16) {
+        let cum = cdf_lo as u32;
+        let freq = (cdf_hi - cdf_lo) as u32;
+        debug_assert!(freq > 0, "zero-frequency symbol (cdf_lo == cdf_hi)");
 
         let r = self.range / PROB_TOTAL;
         // V6: after renormalization range >= TOP (2^24), so r >= 2^24 / 2^15 = 512.
@@ -336,7 +348,10 @@ impl<'a> RangeDecoder<'a> {
 /// Returns compressed data as a byte vector.
 /// The predictor is reset at the start, then advanced byte-by-byte.
 #[must_use = "encode_block returns the compressed data; discarding it silently loses the V8 cache overflow error"]
-pub fn encode_block(data: &[u8], predictor: &mut dyn ProbabilityPredictor) -> Result<Vec<u8>> {
+pub fn encode_block<P: ProbabilityPredictor + ?Sized>(
+    data: &[u8],
+    predictor: &mut P,
+) -> Result<Vec<u8>> {
     encode_block_inner(data, predictor, true)
 }
 
@@ -345,16 +360,16 @@ pub fn encode_block(data: &[u8], predictor: &mut dyn ProbabilityPredictor) -> Re
 /// Used for cross-block predictor state carry within a solid group:
 /// blocks 2+ reuse the predictor state from the previous block's
 /// predict/update calls, giving the predictor prior context.
-pub fn encode_block_continuing(
+pub fn encode_block_continuing<P: ProbabilityPredictor + ?Sized>(
     data: &[u8],
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
 ) -> Result<Vec<u8>> {
     encode_block_inner(data, predictor, false)
 }
 
-fn encode_block_inner(
+fn encode_block_inner<P: ProbabilityPredictor + ?Sized>(
     data: &[u8],
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
     reset: bool,
 ) -> Result<Vec<u8>> {
     if data.is_empty() {
@@ -367,8 +382,12 @@ fn encode_block_inner(
     let mut enc = RangeEncoder::new();
 
     for &byte in data {
-        let cdf = predictor.predict_cdf();
-        enc.encode_cdf(byte, &cdf);
+        // Encode-only fast path: ask the predictor for only the two CDF
+        // entries the range coder consumes (cdf[byte], cdf[byte+1]).
+        // The trait's default impl falls back to predict_cdf + slice, so
+        // predictors that haven't migrated are unaffected.
+        let (lo, hi) = predictor.query_cdf(byte);
+        enc.encode_interval(lo, hi);
         predictor.update(byte);
     }
 
@@ -391,10 +410,10 @@ const MAX_DECODE_SIZE: usize = crate::format::MAX_DECOMPRESSED_BLOCK_SIZE;
 ///
 /// `expected_len` must match the original uncompressed length exactly.
 /// The predictor must be the same type that was used for encoding.
-pub fn decode_block(
+pub fn decode_block<P: ProbabilityPredictor + ?Sized>(
     compressed: &[u8],
     expected_len: usize,
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
 ) -> Result<Vec<u8>> {
     decode_block_inner(compressed, expected_len, predictor, true)
 }
@@ -403,18 +422,18 @@ pub fn decode_block(
 ///
 /// Used for cross-block predictor state carry: the predictor continues
 /// from the state left by the previous block's decode+update calls.
-pub fn decode_block_continuing(
+pub fn decode_block_continuing<P: ProbabilityPredictor + ?Sized>(
     compressed: &[u8],
     expected_len: usize,
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
 ) -> Result<Vec<u8>> {
     decode_block_inner(compressed, expected_len, predictor, false)
 }
 
-fn decode_block_inner(
+fn decode_block_inner<P: ProbabilityPredictor + ?Sized>(
     compressed: &[u8],
     expected_len: usize,
-    predictor: &mut dyn ProbabilityPredictor,
+    predictor: &mut P,
     reset: bool,
 ) -> Result<Vec<u8>> {
     if expected_len == 0 {
