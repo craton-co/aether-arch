@@ -494,6 +494,216 @@ mod tests {
     use crate::entropy::context_mixer::{ContextMixer, ContextMixerConfig};
     use crate::entropy::order0::Order0Model;
 
+    /// Reference (pre-optimization) implementation of `probs_to_cdf`,
+    /// kept verbatim so we can prove bit-identity against the optimized
+    /// version on a wide test corpus. NOT exported — tests only.
+    ///
+    /// If you change this, also update the production `probs_to_cdf` and
+    /// re-run [`probs_to_cdf_matches_reference_on_diverse_inputs`].
+    #[allow(clippy::needless_range_loop)]
+    fn probs_to_cdf_reference(probs: &[f32; 256]) -> [u16; 257] {
+        let mut cdf = [0u16; 257];
+        let mut clamped = [0.0f64; 256];
+        for i in 0..256 {
+            let p = probs[i] as f64;
+            clamped[i] = if p.is_finite() && p > 0.0 { p } else { 0.0 };
+        }
+        let sum: f64 = clamped.iter().sum();
+        if sum <= 0.0 {
+            for (i, cdf_val) in cdf.iter_mut().enumerate() {
+                *cdf_val = (i as u32 * PROB_TOTAL / 256) as u16;
+            }
+            cdf[256] = PROB_TOTAL as u16;
+            return cdf;
+        }
+        let scale: f64 = PROB_TOTAL as f64 / sum;
+        let mut cum: f64 = 0.0;
+        for i in 0..256 {
+            cdf[i] = (cum * scale + 0.5) as u16;
+            cum += clamped[i];
+        }
+        cdf[256] = PROB_TOTAL as u16;
+        for i in 0..256 {
+            if cdf[i + 1] <= cdf[i] {
+                cdf[i + 1] = cdf[i] + 1;
+            }
+        }
+        if cdf[256] != PROB_TOTAL as u16 {
+            const N: usize = 256;
+            let remaining_mass = PROB_TOTAL as usize - N;
+            let mut freqs = [1u16; N];
+            let mut distributed = 0usize;
+            for i in 0..N {
+                let share = (clamped[i] / sum * remaining_mass as f64) as usize;
+                freqs[i] += share as u16;
+                distributed += share;
+            }
+            let mut leftover = remaining_mass - distributed;
+            if leftover > 0 {
+                let mut indices: Vec<usize> = (0..N).collect();
+                indices.sort_unstable_by(|&a, &b| {
+                    clamped[b]
+                        .partial_cmp(&clamped[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for &idx in &indices {
+                    if leftover == 0 {
+                        break;
+                    }
+                    freqs[idx] += 1;
+                    leftover -= 1;
+                }
+            }
+            cdf[0] = 0;
+            for i in 0..N {
+                cdf[i + 1] = cdf[i] + freqs[i];
+            }
+            if cdf[256] != PROB_TOTAL as u16 {
+                for (i, cdf_val) in cdf.iter_mut().enumerate() {
+                    *cdf_val = (i as u32 * PROB_TOTAL / 256) as u16;
+                }
+                cdf[256] = PROB_TOTAL as u16;
+            }
+        }
+        cdf
+    }
+
+    /// The optimized `probs_to_cdf` must produce a CDF that is byte-exactly
+    /// equal to the reference for ALL inputs we care about. This is the
+    /// primary backward-compat guard: existing archives encode bytes
+    /// against the reference algorithm, and any deviation silently
+    /// corrupts decompression.
+    #[test]
+    fn probs_to_cdf_matches_reference_on_diverse_inputs() {
+        // Test corpus covers: uniform, peaked (overshoot territory),
+        // near-uniform with one tiny entry, all-tied-tiny (MIN_PROB clamp
+        // collapse), incremental-decay, and a pseudo-random distribution.
+        let mut cases: Vec<[f32; 256]> = Vec::new();
+
+        // 1. Uniform.
+        cases.push([1.0 / 256.0; 256]);
+
+        // 2. Peaked: one symbol dominant, rest tiny (NeuralSSM after RLE
+        //    training). Forces overshoot.
+        let mut peaked = [1e-6f32; 256];
+        peaked[0] = 0.99;
+        cases.push(peaked);
+
+        // 3. Two peaks (RUNA + RUNB pattern after BWT+MTF+RLE).
+        let mut two_peak = [1e-6f32; 256];
+        two_peak[0] = 0.6;
+        two_peak[1] = 0.39;
+        cases.push(two_peak);
+
+        // 4. All entries clamped to MIN_PROB equivalent — maximum tie
+        //    pressure on the leftover-sort branch.
+        cases.push([1e-7f32; 256]);
+
+        // 5. Geometric decay (typical Order0 mid-training).
+        let mut geom = [0.0f32; 256];
+        let mut v = 0.5f32;
+        for slot in geom.iter_mut() {
+            *slot = v.max(1e-7);
+            v *= 0.97;
+        }
+        cases.push(geom);
+
+        // 6. Pseudo-random LCG distribution.
+        let mut rng_state = 0x9e37_79b9u32;
+        let mut rand_probs = [0.0f32; 256];
+        for slot in rand_probs.iter_mut() {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *slot = (rng_state >> 8) as f32 / (1u32 << 24) as f32;
+        }
+        cases.push(rand_probs);
+
+        // 7. Sparse: only 5 non-zero entries (heavy overshoot path).
+        let mut sparse = [1e-8f32; 256];
+        sparse[10] = 0.5;
+        sparse[50] = 0.3;
+        sparse[100] = 0.15;
+        sparse[150] = 0.04;
+        sparse[200] = 0.01;
+        cases.push(sparse);
+
+        for (idx, probs) in cases.iter().enumerate() {
+            let opt = probs_to_cdf(probs);
+            let reference = probs_to_cdf_reference(probs);
+            assert_eq!(
+                opt, reference,
+                "probs_to_cdf diverged from reference on case #{idx}"
+            );
+        }
+    }
+
+    /// Microbench: compare optimized `probs_to_cdf` against the reference
+    /// implementation by replaying the NeuralSSM predict-loop on the same
+    /// English text corpus the criterion benchmarks use. Run with
+    /// `--ignored --nocapture` to see the numbers.
+    ///
+    /// This is repeatable (single tight loop, minimal harness noise) and
+    /// directly measures the function we're optimizing — unlike the
+    /// criterion `compress_ssm` bench which has ±30% machine variance.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "bwt-encode")]
+    fn probs_to_cdf_microbench_vs_reference() {
+        use crate::entropy::NeuralSsmPredictor;
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("large");
+        let text = match std::fs::read(dir.join("english.txt")) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("[microbench] english.txt fixture missing, skipping");
+                return;
+            }
+        };
+        let bwt_data = match crate::coding::bwt_preprocess::bwt_mtf_encode(&text) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        eprintln!("[microbench] BWT-encoded corpus: {} bytes", bwt_data.len());
+
+        // Run the NeuralSSM predict() → probs_to_cdf() pipeline, which is
+        // structurally identical to what predict_cdf does internally and
+        // hits the same overshoot ratio (~98.76%).
+        let bench = |name: &str, cdf_fn: fn(&[f32; 256]) -> [u16; 257]| {
+            let mut pred = NeuralSsmPredictor::new();
+            let start = std::time::Instant::now();
+            let mut total_sample = 0u64; // prevent dead-code elimination
+            for &byte in &bwt_data {
+                let probs = pred.predict();
+                let cdf = cdf_fn(&probs);
+                total_sample = total_sample.wrapping_add(cdf[byte as usize] as u64);
+                pred.update(byte);
+            }
+            let elapsed = start.elapsed();
+            let mbps = bwt_data.len() as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+            eprintln!(
+                "[{}] {:?}  ({:.3} MiB/s)  sample={}",
+                name, elapsed, mbps, total_sample
+            );
+            elapsed
+        };
+
+        // Warm-up (file I/O, BWT, predictor init) is already done; cache
+        // is hot. Run reference first, then optimized.
+        let reference_time = bench("reference", probs_to_cdf_reference);
+        let optimized_time = bench("optimized", probs_to_cdf);
+
+        let speedup = reference_time.as_secs_f64() / optimized_time.as_secs_f64();
+        let delta_pct = (1.0 - optimized_time.as_secs_f64() / reference_time.as_secs_f64()) * 100.0;
+        eprintln!(
+            "[delta] optimized is {:+.2}% vs reference (speedup {:.3}x)",
+            delta_pct, speedup
+        );
+    }
+
     // ── CDF sanity ──────────────────────────────────────────────────
 
     #[test]
