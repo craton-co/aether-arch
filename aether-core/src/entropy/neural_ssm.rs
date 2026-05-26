@@ -813,10 +813,16 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
             None => return false,
         };
 
+        // Layout MUST match save_state: all counts (NUM_O2_CTX * 254) as one
+        // contiguous block, THEN all totals (NUM_O2_CTX) as a second block.
+        // (Prior to the fix, load read these interleaved per-context, which
+        // silently corrupted every dictionary whose contexts weren't all
+        // empty — the consistency check below would reject a context's total
+        // read from the next context's first count.)
         let mut o2_lit_counts = [[0u32; 254]; NUM_O2_CTX];
         let mut o2_lit_totals = [0u32; NUM_O2_CTX];
+        let mut computed_totals = [0u64; NUM_O2_CTX];
         for ctx in 0..NUM_O2_CTX {
-            let mut computed_total: u64 = 0;
             for lit_count in o2_lit_counts[ctx].iter_mut() {
                 let c = match read_u32(data, &mut off) {
                     Some(v) => v,
@@ -826,14 +832,18 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
                     return false; // Reject adversarially large counts
                 }
                 *lit_count = c;
-                computed_total += c as u64;
+                computed_totals[ctx] += c as u64;
             }
+        }
+        for ctx in 0..NUM_O2_CTX {
             o2_lit_totals[ctx] = match read_u32(data, &mut off) {
                 Some(v) => v,
                 None => return false,
             };
             // Validate totals are consistent with counts
-            if computed_total > u32::MAX as u64 || o2_lit_totals[ctx] != computed_total as u32 {
+            if computed_totals[ctx] > u32::MAX as u64
+                || o2_lit_totals[ctx] != computed_totals[ctx] as u32
+            {
                 return false;
             }
         }
@@ -1258,6 +1268,49 @@ mod tests {
             );
             pred.update(b);
             fresh.update(b);
+        }
+    }
+
+    #[test]
+    fn save_load_state_roundtrip_preserves_predictions() {
+        // Train on varied data so multiple order-2 contexts are non-empty.
+        // Empty contexts (the previous tests' regime) hid the counts/totals
+        // block-vs-interleaved layout bug because 0 == 0 always validated.
+        let mut pred = NeuralSsmPredictor::new();
+        let training: Vec<u8> = (0..5000u32)
+            .map(|i| ((i * 31 + i / 7) % 256) as u8)
+            .collect();
+        for &b in &training {
+            pred.predict();
+            pred.update(b);
+        }
+
+        let state = pred.save_state().expect("ssm supports save_state");
+        let mut loaded = NeuralSsmPredictor::new();
+        assert!(
+            loaded.load_state(&state),
+            "load_state must accept its own save_state output"
+        );
+
+        // Learned tables must survive the round-trip exactly.
+        assert_eq!(pred.o2_lit_totals, loaded.o2_lit_totals, "o2_lit_totals");
+        assert_eq!(*pred.o2_lit_counts, *loaded.o2_lit_counts, "o2_lit_counts");
+        assert_eq!(pred.w_run, loaded.w_run, "w_run");
+        assert_eq!(pred.w_runa, loaded.w_runa, "w_runa");
+        assert_eq!(pred.step, loaded.step, "step");
+
+        // Behavioral equality: predict() before update() on both so the
+        // cached last_* fields are set identically each step.
+        let stream: Vec<u8> = (0..300u32).map(|i| (i % 256) as u8).collect();
+        for &b in &stream {
+            assert_eq!(
+                pred.predict(),
+                loaded.predict(),
+                "prediction diverged after save/load at step {}",
+                pred.step
+            );
+            pred.update(b);
+            loaded.update(b);
         }
     }
 

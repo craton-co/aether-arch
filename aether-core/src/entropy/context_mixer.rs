@@ -354,6 +354,66 @@ impl ProbabilityPredictor for ContextMixer {
             PredictorId::ContextMixer
         }
     }
+
+    /// Serialize a compact dictionary state.
+    ///
+    /// NOTE: This deliberately serializes ONLY the learned mixing weights
+    /// (plus a config fingerprint), NOT the per-order frequency tables.
+    /// The default ContextMixer carries ~100 MiB of hash tables, which is
+    /// impractical to ship as a portable `.aed` dictionary. A cm dictionary
+    /// therefore warm-starts the mixer's weighting of its sub-models; the
+    /// tables themselves start fresh. For state that meaningfully transfers
+    /// across files, use the `ssm` predictor (compact ~11 KiB state).
+    ///
+    /// Format: `[version: u8=1][is_lightweight: u8][num_models: u32 LE]
+    ///          [weights: f64 LE * num_models]`
+    fn save_state(&self) -> Option<Vec<u8>> {
+        let mut buf = Vec::with_capacity(1 + 1 + 4 + self.weights.len() * 8);
+        buf.push(1); // version
+        buf.push(self.is_lightweight as u8);
+        buf.extend_from_slice(&(self.weights.len() as u32).to_le_bytes());
+        for &w in &self.weights {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        Some(buf)
+    }
+
+    fn load_state(&mut self, data: &[u8]) -> bool {
+        // version + is_lightweight + num_models
+        if data.len() < 6 || data[0] != 1 {
+            return false;
+        }
+        // The dictionary must have been trained for the same cm variant,
+        // otherwise the mixing weights index a different sub-model set.
+        if (data[1] != 0) != self.is_lightweight {
+            return false;
+        }
+        let num_models = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        if num_models != self.models.len() {
+            return false; // weight vector must match this config's sub-models
+        }
+        let expected = 6 + num_models * 8;
+        if data.len() != expected {
+            return false; // strict: no trailing/truncated bytes
+        }
+        let mut weights = Vec::with_capacity(num_models);
+        let mut off = 6;
+        for _ in 0..num_models {
+            let bytes: [u8; 8] = match data[off..off + 8].try_into() {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            let w = f64::from_le_bytes(bytes);
+            // Reject non-finite or negative weights (mixer invariant: w >= 0).
+            if !w.is_finite() || w < 0.0 {
+                return false;
+            }
+            weights.push(w);
+            off += 8;
+        }
+        self.weights = weights;
+        true
+    }
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -479,6 +539,38 @@ mod tests {
         assert!(
             (max_p - min_p) < 0.01,
             "After reset, max={max_p} min={min_p} — should be ~uniform"
+        );
+    }
+
+    #[test]
+    fn save_load_state_roundtrips_mixer_weights() {
+        use crate::entropy::ProbabilityPredictor;
+        let mut mixer = ContextMixer::with_config(ContextMixerConfig::lightweight());
+        let text = b"the quick brown fox jumps over the lazy dog; the dog sleeps.";
+        for _ in 0..50 {
+            for &b in text {
+                mixer.predict();
+                mixer.update(b);
+            }
+        }
+        let state = mixer.save_state().expect("cm now supports save_state");
+
+        let mut loaded = ContextMixer::with_config(ContextMixerConfig::lightweight());
+        assert!(
+            loaded.load_state(&state),
+            "load_state must accept its own output"
+        );
+        assert_eq!(
+            mixer.weights, loaded.weights,
+            "mixer weights must round-trip"
+        );
+
+        // A dictionary trained for the OTHER variant must be rejected
+        // (different sub-model set → weight indices wouldn't line up).
+        let mut full = ContextMixer::with_config(ContextMixerConfig::default());
+        assert!(
+            !full.load_state(&state),
+            "lightweight dict must not load into the full cm variant"
         );
     }
 
