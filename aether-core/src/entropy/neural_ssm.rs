@@ -32,10 +32,24 @@ const D_MAX: usize = 32;
 const MIN_PROB: f32 = 1e-6;
 
 /// Number of order-2 context buckets for literal prediction.
-const NUM_O2_CTX: usize = 8;
+///
+/// Stage B: raised from 8 (4 prev-classes × 2 prev_prev-classes) to 64
+/// (8 × 8). On the BWT+MTF+RLE stream the "literals" are MTF ranks, which
+/// cluster heavily near zero, so finer conditioning on the previous two
+/// ranks sharpens the literal distribution. Pure integer counting — adds
+/// no floating-point math, so cross-platform determinism is unaffected.
+const NUM_O2_CTX: usize = 64;
 
 /// Pseudocount per literal value in order-2 model.
 const O2_ALPHA: f32 = 0.5;
+
+/// Stage B confidence constant for the order-2 literal blend. The effective
+/// blend weight is `o2_lit_blend * obs / (obs + O2_CONF_K)`, so a context
+/// reaches half its target blend after ~`O2_CONF_K` observations. This lets
+/// the finer (64-context) model defer to the global RLE distribution while a
+/// context is still sparse — fixing the regression a fixed blend caused when
+/// contexts were subdivided. Deterministic integer/f32 math only.
+const O2_CONF_K: f32 = 32.0;
 
 /// Default blend weight for order-2 literal model (0 = pure RLE, 1 = pure order-2).
 /// Tuned via greedy sweep on Silesia corpus (202 MiB, 12 files). 0.3 wins over 0.1
@@ -317,20 +331,27 @@ impl NeuralSsmPredictor {
     }
 
     /// Hash previous two bytes into an order-2 context index for literals.
+    ///
+    /// 8 buckets per byte (64 contexts total). MTF ranks cluster near zero,
+    /// so the low ranks get exact buckets and larger ranks are grouped
+    /// logarithmically. `bucket(0..=3)` are exact; then 4-5, 6-9, 10-19, 20+.
+    #[inline]
+    fn rank_bucket(b: u8) -> usize {
+        match b {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4..=5 => 4,
+            6..=9 => 5,
+            10..=19 => 6,
+            _ => 7,
+        }
+    }
+
     fn o2_context(prev: u8, prev_prev: u8) -> usize {
-        // 4 classes for prev: run(0-1), lit_lo(2-5), lit_mid(6-15), lit_hi(16+)
-        let a = if prev <= 1 {
-            0u32
-        } else if prev <= 5 {
-            1
-        } else if prev <= 15 {
-            2
-        } else {
-            3
-        };
-        // 2 classes for prev_prev: run vs literal
-        let b = if prev_prev <= 1 { 0u32 } else { 1 };
-        (a * 2 + b) as usize
+        // 8 prev-buckets × 8 prev_prev-buckets = 64 contexts.
+        Self::rank_bucket(prev) * 8 + Self::rank_bucket(prev_prev)
     }
 
     /// Compute mixing weight alpha for the SSM component.
@@ -392,18 +413,21 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
         let inv_rle_lit = 1.0 / rle_p_lit_total;
         let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-        let o2_total = self.o2_lit_totals[o2_ctx] as f32 + 254.0 * O2_ALPHA;
+        let o2_obs = self.o2_lit_totals[o2_ctx];
+        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
         let inv_o2_total = 1.0 / o2_total;
-        let o2_blend = self.cfg.o2_lit_blend;
-        let rle_weight = 1.0 - o2_blend;
-        let use_o2 = self.o2_lit_totals[o2_ctx] >= self.cfg.o2_min_obs && o2_blend > 0.0;
+        // Confidence-weighted blend (Stage B): a sparse context defers to the
+        // global RLE distribution; influence grows with observation count.
+        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
+        let rle_weight = 1.0 - eff_blend;
+        let use_o2 = eff_blend > 0.0;
         let p_lit = 1.0 - p_run;
 
         for i in 2..256 {
             let rle_p = rle_probs[i] * inv_rle_lit;
             let lit_p = if use_o2 {
                 let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                rle_weight * rle_p + o2_blend * o2_p
+                rle_weight * rle_p + eff_blend * o2_p
             } else {
                 rle_p
             };
@@ -465,16 +489,18 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         // - materializing a separate [f32;256] intermediate for predict()
         let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
         let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-        let o2_total = self.o2_lit_totals[o2_ctx] as f32 + 254.0 * O2_ALPHA;
-        let o2_blend = self.cfg.o2_lit_blend;
-        let o2_has_data = self.o2_lit_totals[o2_ctx] >= self.cfg.o2_min_obs;
+        let o2_obs = self.o2_lit_totals[o2_ctx];
+        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
+        // Confidence-weighted blend (Stage B) — MUST match predict() exactly so
+        // the [f32;256] and direct-CDF paths agree.
+        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
 
         // First pass: compute raw probs and sum.
         // Precompute reciprocals to replace 254+ divisions with multiplies.
         let inv_rle_lit = 1.0 / rle_p_lit_total;
         let inv_o2_total = 1.0 / o2_total;
-        let rle_weight = 1.0 - o2_blend;
-        let use_o2 = o2_has_data && o2_blend > 0.0;
+        let rle_weight = 1.0 - eff_blend;
+        let use_o2 = eff_blend > 0.0;
 
         let mut raw = [0.0f32; 256];
         raw[0] = (p_run * p_runa).max(MIN_PROB);
@@ -485,7 +511,7 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
             let rle_p = rle_probs[i] * inv_rle_lit;
             let lit_p = if use_o2 {
                 let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                rle_weight * rle_p + o2_blend * o2_p
+                rle_weight * rle_p + eff_blend * o2_p
             } else {
                 rle_p
             };
@@ -934,14 +960,15 @@ impl NeuralSsmPredictor {
 
         let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
         let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-        let o2_total = self.o2_lit_totals[o2_ctx] as f32 + 254.0 * O2_ALPHA;
-        let o2_blend = self.cfg.o2_lit_blend;
-        let o2_has_data = self.o2_lit_totals[o2_ctx] >= self.cfg.o2_min_obs;
+        let o2_obs = self.o2_lit_totals[o2_ctx];
+        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
+        // Must mirror predict_cdf()'s confidence-weighted blend exactly.
+        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
 
         let inv_rle_lit = 1.0 / rle_p_lit_total;
         let inv_o2_total = 1.0 / o2_total;
-        let rle_weight = 1.0 - o2_blend;
-        let use_o2 = o2_has_data && o2_blend > 0.0;
+        let rle_weight = 1.0 - eff_blend;
+        let use_o2 = eff_blend > 0.0;
 
         let mut raw = [0.0f32; 256];
         raw[0] = (p_run * p_runa).max(MIN_PROB);
@@ -952,7 +979,7 @@ impl NeuralSsmPredictor {
             let rle_p = rle_probs[i] * inv_rle_lit;
             let lit_p = if use_o2 {
                 let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                rle_weight * rle_p + o2_blend * o2_p
+                rle_weight * rle_p + eff_blend * o2_p
             } else {
                 rle_p
             };
