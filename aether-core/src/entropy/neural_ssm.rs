@@ -212,6 +212,14 @@ pub struct NeuralSsmPredictor {
     last_rle_p_runa: f32,
 
     step: u32,
+
+    /// Stage A: optional per-block reset baseline (a serialized predictor
+    /// state from a pretrained dictionary). When set, `reset()` restores
+    /// THIS state instead of zeroing — so every block starts from the
+    /// dictionary's learned distribution while remaining independently
+    /// decodable (seekability preserved). NOT part of `save_state`; it is a
+    /// coding-time seed supplied identically at encode and decode.
+    dict_baseline: Option<Vec<u8>>,
 }
 
 impl NeuralSsmPredictor {
@@ -315,7 +323,21 @@ impl NeuralSsmPredictor {
             last_rle_p_run: 0.5,
             last_rle_p_runa: 0.5,
             step: 0,
+            dict_baseline: None,
         }
+    }
+
+    /// Stage A: set a pretrained dictionary state as the per-block reset
+    /// baseline. Returns `true` if the state is valid and was applied (the
+    /// predictor is immediately reset to it); `false` leaves the predictor
+    /// unchanged. The same state must be supplied at decode time.
+    pub fn set_dict_baseline(&mut self, state: &[u8]) -> bool {
+        // Validate by loading into self; load_state commits only on success.
+        if !self.load_state(state) {
+            return false;
+        }
+        self.dict_baseline = Some(state.to_vec());
+        true
     }
 
     /// Compute SSM's binary predictions from hidden state.
@@ -672,6 +694,16 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
     }
 
     fn reset(&mut self) {
+        // Stage A: if a dictionary baseline is set, restore THAT state so
+        // every block starts from the pretrained distribution. We clone the
+        // bytes first to avoid borrowing self while load_state mutates it;
+        // the baseline was validated in set_dict_baseline, so this succeeds.
+        if let Some(baseline) = self.dict_baseline.clone() {
+            let ok = self.load_state(&baseline);
+            debug_assert!(ok, "dict_baseline was validated on set, must reload");
+            // load_state does not touch dict_baseline, so it persists.
+            return;
+        }
         // Zero only mutable state in-place. Deterministic fields (cfg, a, a_inv,
         // embed) are pure functions of config and never need recomputation.
         // This avoids 2 Box re-allocations and 8192 det_hash() calls per reset.
@@ -695,6 +727,14 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         self.last_rle_p_runa = 0.5;
         self.step = 0;
         self.rle.reset();
+    }
+
+    fn coding_baseline(&self) -> Option<&[u8]> {
+        self.dict_baseline.as_deref()
+    }
+
+    fn set_coding_baseline(&mut self, state: &[u8]) -> bool {
+        self.set_dict_baseline(state)
     }
 
     fn name(&self) -> &str {
@@ -1339,6 +1379,48 @@ mod tests {
             pred.update(b);
             loaded.update(b);
         }
+    }
+
+    #[test]
+    fn reset_restores_dict_baseline_not_zero() {
+        // Build a representative baseline by training, then capture it.
+        let training: Vec<u8> = (0..3000u32)
+            .map(|i| ((i * 7 + i / 3) % 256) as u8)
+            .collect();
+        let mut trained = NeuralSsmPredictor::new();
+        for &b in &training {
+            trained.predict();
+            trained.update(b);
+        }
+        let baseline = trained.save_state().unwrap();
+
+        // Installing the baseline immediately sets state to it.
+        let mut pred = NeuralSsmPredictor::new();
+        assert!(pred.set_dict_baseline(&baseline));
+        assert_eq!(pred.save_state().unwrap(), baseline);
+        assert_eq!(pred.coding_baseline(), Some(baseline.as_slice()));
+
+        // Dirty the state, then reset() must restore the BASELINE, not zero.
+        for &b in b"completely different bytes 12345" {
+            pred.predict();
+            pred.update(b);
+        }
+        pred.reset();
+        assert_eq!(
+            pred.save_state().unwrap(),
+            baseline,
+            "reset() with a dict baseline must restore the baseline, not zero"
+        );
+
+        // Without a baseline, reset() returns to the fresh (zeroed) state.
+        let mut plain = NeuralSsmPredictor::new();
+        plain.update(5);
+        plain.reset();
+        assert_eq!(
+            plain.save_state().unwrap(),
+            NeuralSsmPredictor::new().save_state().unwrap(),
+            "reset() without a baseline must zero the state"
+        );
     }
 
     #[test]

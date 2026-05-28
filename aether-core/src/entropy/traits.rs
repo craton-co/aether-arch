@@ -97,6 +97,21 @@ pub trait ProbabilityPredictor: Send {
     fn load_state(&mut self, _data: &[u8]) -> bool {
         false
     }
+
+    /// Stage A: the per-block coding baseline this predictor will reset to,
+    /// if a dictionary has been installed as a baseline. Used by the router
+    /// to propagate the baseline onto the internal coding predictors it
+    /// builds per chunk (e.g. the BWT path's NeuralSSM). Returns `None` when
+    /// no baseline is set or the predictor doesn't support dictionaries.
+    fn coding_baseline(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Stage A: install a dictionary state as this predictor's per-block
+    /// reset baseline. Returns `true` if applied. Default: unsupported.
+    fn set_coding_baseline(&mut self, _state: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Validate that a probability distribution is well-formed for use with the

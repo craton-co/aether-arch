@@ -1181,16 +1181,33 @@ fn main() -> Result<()> {
                 anyhow::bail!("No training files found");
             }
 
+            // NeuralSSM dictionaries are used as the BWT coding path's
+            // per-block reset baseline (Stage A), so they must be trained on
+            // the same BWT+MTF+RLE-transformed stream the coder sees. Other
+            // predictors seed the raw-byte plain path, so train on raw bytes.
+            let transformed = matches!(predictor_id, PredictorId::NeuralSsm);
             eprintln!(
-                "Training {:?} dictionary on {} file(s)...",
+                "Training {:?} dictionary on {} file(s){}...",
                 predictor_id,
-                training_files.len()
+                training_files.len(),
+                if transformed {
+                    " (BWT+MTF+RLE transformed)"
+                } else {
+                    ""
+                }
             );
 
-            let dict = aether_core::dictionary::Dictionary::train(
-                predictor_instance.as_mut(),
-                &training_files,
-            )?;
+            let dict = if transformed {
+                aether_core::dictionary::Dictionary::train_transformed(
+                    predictor_instance.as_mut(),
+                    &training_files,
+                )?
+            } else {
+                aether_core::dictionary::Dictionary::train(
+                    predictor_instance.as_mut(),
+                    &training_files,
+                )?
+            };
             let mut out_file = out_file;
             dict.write_to(&mut out_file)?;
 
