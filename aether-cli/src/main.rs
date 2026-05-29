@@ -61,6 +61,13 @@ enum Commands {
         #[arg(long)]
         dictionary: Option<PathBuf>,
 
+        /// Auto-select a built-in dictionary by detected content type and keep
+        /// it only if it shrinks the archive (never-regress). Implies the ssm
+        /// predictor. Ignored if --dictionary is given. Extract resolves the
+        /// dictionary automatically — no flag needed.
+        #[arg(long)]
+        auto_dict: bool,
+
         /// Overwrite output file if it already exists
         #[arg(long)]
         force: bool,
@@ -623,10 +630,17 @@ fn require_enterprise_for_password(
 }
 
 /// Q2: Build a Decompressor with common setup (password, dictionary).
+///
+/// `archive_has_dict` indicates the archive's FLAG_HAS_DICTIONARY. When set
+/// and the user supplied no `--dictionary`, a built-in dictionary is attached
+/// automatically (resolved by content type) so auto-dict archives extract
+/// transparently. If the archive used a non-built-in dictionary, the
+/// decompressor's hash check reports a clear mismatch asking for --dictionary.
 fn build_decompressor(
     factory: Box<dyn Fn() -> Box<dyn ProbabilityPredictor> + Send + Sync>,
     #[allow(unused_variables)] resolved_pw: &Option<Zeroizing<String>>,
     dictionary: &Option<PathBuf>,
+    archive_has_dict: bool,
 ) -> Result<Decompressor> {
     let mut decompressor = Decompressor::new(move || factory());
 
@@ -640,9 +654,30 @@ fn build_decompressor(
             .with_context(|| format!("Cannot load dictionary: {}", dict_path.display()))?;
         decompressor = decompressor.with_dictionary(dict);
         eprintln!("Using dictionary: {}", dict_path.display());
+    } else if archive_has_dict {
+        // Auto-resolve a built-in dictionary (only the text one exists today).
+        // Safe: only attached when the archive actually used a dictionary, so
+        // it can never seed a baseline a no-dict archive didn't use.
+        if let Some(dict) =
+            aether_core::builtin_dicts::for_content_type(aether_core::format::ContentType::Text)
+        {
+            decompressor = decompressor.with_dictionary(dict);
+            eprintln!("Using built-in dictionary (auto-resolved)");
+        }
     }
 
     Ok(decompressor)
+}
+
+/// Read just the archive header to check whether it was compressed with a
+/// dictionary (FLAG_HAS_DICTIONARY). Returns `false` on any read error.
+fn archive_uses_dictionary(path: &Path) -> bool {
+    use aether_core::format::FLAG_HAS_DICTIONARY;
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|mut f| ArchiveHeader::read_from(&mut f).ok())
+        .map(|h| h.flags & FLAG_HAS_DICTIONARY != 0)
+        .unwrap_or(false)
 }
 
 /// Q2: Resolve the predictor factory — either from an explicit name or auto-detected from the archive.
@@ -671,6 +706,7 @@ fn main() -> Result<()> {
             cipher,
             analytics: show_analytics,
             dictionary,
+            auto_dict,
             force,
         } => {
             // S10: warn if --cipher was explicitly set without enterprise feature
@@ -683,7 +719,92 @@ fn main() -> Result<()> {
             }
             // S7: atomic overwrite protection — obtain the file handle early so
             // there is no TOCTOU gap between the existence check and create.
-            let out_file = create_output_file(&output, force)?;
+            let mut out_file = create_output_file(&output, force)?;
+
+            // ── Auto-dictionary (never-regress) ──────────────────────────
+            // Detect the input's content type, and if a built-in dictionary
+            // exists for it, compress WITH and WITHOUT the dictionary (ssm)
+            // and keep whichever archive is smaller. Extract resolves the
+            // dictionary automatically by its hash, so no flag is needed.
+            if auto_dict && dictionary.is_none() {
+                use std::io::{Read, Write};
+                if password.is_some() {
+                    anyhow::bail!(
+                        "--auto-dict cannot be combined with --password yet; \
+                         use --dictionary explicitly or drop encryption."
+                    );
+                }
+                let (base_dir, files) = collect_files(&inputs)?;
+                if files.is_empty() {
+                    anyhow::bail!("No files to compress");
+                }
+                // Detect content type from the first file's head + extension.
+                let first = &files[0];
+                let mut head = vec![0u8; 512];
+                let n = std::fs::File::open(first)
+                    .and_then(|mut f| f.read(&mut head))
+                    .unwrap_or(0);
+                head.truncate(n);
+                let ct =
+                    aether_core::analyzer::detect_content_type(&first.to_string_lossy(), &head);
+
+                if let Some(bdict) = aether_core::builtin_dicts::for_content_type(ct) {
+                    eprintln!(
+                        "Auto-dict: detected {ct:?}; evaluating built-in dictionary \
+                         (never-regress, ssm)..."
+                    );
+                    // Pass 1: with the built-in dictionary. (Archive writing
+                    // needs Seek, so compress into an in-memory Cursor.)
+                    let f1 = make_predictor_factory("ssm")?;
+                    let mut cur_with = Cursor::new(Vec::new());
+                    let (stats, _) = Compressor::new(move || f1())
+                        .with_dictionary(bdict)
+                        .compress_to_archive(&base_dir, &files, &mut cur_with)?;
+                    let buf_with = cur_with.into_inner();
+                    // Pass 2: without any dictionary.
+                    let f2 = make_predictor_factory("ssm")?;
+                    let mut cur_without = Cursor::new(Vec::new());
+                    Compressor::new(move || f2()).compress_to_archive(
+                        &base_dir,
+                        &files,
+                        &mut cur_without,
+                    )?;
+                    let buf_without = cur_without.into_inner();
+
+                    let used = buf_with.len() < buf_without.len();
+                    let winner = if used { &buf_with } else { &buf_without };
+                    out_file.write_all(winner)?;
+                    out_file.flush()?;
+
+                    let original = stats.original_size;
+                    eprintln!();
+                    eprintln!("  Archive:     {}", output.display());
+                    eprintln!("  Original:    {}", fmt_size(original, BINARY));
+                    eprintln!("  Compressed:  {}", fmt_size(winner.len() as u64, BINARY));
+                    eprintln!(
+                        "  Auto-dict:   {} (with={} B, without={} B)",
+                        if used {
+                            "USED (smaller)"
+                        } else {
+                            "skipped (no gain)"
+                        },
+                        buf_with.len(),
+                        buf_without.len(),
+                    );
+                    if original > 0 {
+                        eprintln!(
+                            "  Ratio:       {:.2}%",
+                            winner.len() as f64 / original as f64 * 100.0
+                        );
+                    }
+                    return Ok(());
+                } else {
+                    eprintln!(
+                        "Auto-dict: no built-in dictionary for {ct:?}; compressing normally."
+                    );
+                    // Fall through to the normal single-pass path below.
+                }
+            }
 
             let factory = make_predictor_factory(&predictor)?;
             let mut compressor = Compressor::new(move || factory());
@@ -855,7 +976,10 @@ fn main() -> Result<()> {
                     eprintln!("Auto-detected predictor: {:?}", id);
                     make_predictor_factory_from_id(id)
                 };
-                let decompressor = build_decompressor(factory, &resolved_pw, &dictionary)?;
+                let has_dict =
+                    metadata.header.flags & aether_core::format::FLAG_HAS_DICTIONARY != 0;
+                let decompressor =
+                    build_decompressor(factory, &resolved_pw, &dictionary, has_dict)?;
 
                 std::fs::create_dir_all(&output)?;
                 decompressor.extract_with_streaming_metadata(&mut stdin, &metadata, &output)?;
@@ -867,7 +991,12 @@ fn main() -> Result<()> {
                 // ── Seekable mode: read from file ───────────────────────
                 let factory = resolve_predictor_factory(&predictor, &input)?;
                 #[allow(unused_mut)]
-                let mut decompressor = build_decompressor(factory, &resolved_pw, &dictionary)?;
+                let mut decompressor = build_decompressor(
+                    factory,
+                    &resolved_pw,
+                    &dictionary,
+                    archive_uses_dictionary(&input),
+                )?;
 
                 #[cfg(feature = "enterprise")]
                 if threads != 1 {
@@ -998,14 +1127,21 @@ fn main() -> Result<()> {
                     eprintln!("Auto-detected predictor: {:?}", id);
                     make_predictor_factory_from_id(id)
                 };
-                let decompressor = build_decompressor(factory, &resolved_pw, &None)?;
+                let has_dict =
+                    metadata.header.flags & aether_core::format::FLAG_HAS_DICTIONARY != 0;
+                let decompressor = build_decompressor(factory, &resolved_pw, &None, has_dict)?;
 
                 eprintln!("Verifying (streaming)...");
                 decompressor.verify_with_streaming_metadata(&mut stdin, &metadata)?
             } else {
                 // ── Seekable verify ─────────────────────────────────────
                 let factory = resolve_predictor_factory(&predictor, &input)?;
-                let decompressor = build_decompressor(factory, &resolved_pw, &None)?;
+                let decompressor = build_decompressor(
+                    factory,
+                    &resolved_pw,
+                    &None,
+                    archive_uses_dictionary(&input),
+                )?;
 
                 let mut archive = std::fs::File::open(&input)
                     .with_context(|| format!("Cannot open {}", input.display()))?;
