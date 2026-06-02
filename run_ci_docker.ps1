@@ -211,11 +211,11 @@ function Test-Doc {
 }
 
 function Test-MSRV {
-    Write-Section "6. MSRV Check (Rust 1.85.0)"
-    Write-Info "Command: cargo +1.85.0 check --workspace"
+    Write-Section "6. MSRV Check (Rust 1.88.0)"
+    Write-Info "Command: cargo +1.88.0 check --workspace"
     $RunArgs = @("run", "--rm", "--name", "$ContainerName-msrv", "--cpus", "4", "--memory", "8g",
                  "-v", "${ProjectRoot}:/workspace", "-w", "/workspace", $ImageName,
-                 "bash", "-c", "rustup install 1.85.0 && cargo +1.85.0 check --workspace")
+                 "bash", "-c", "rustup install 1.88.0 && cargo +1.88.0 check --workspace")
     & docker @RunArgs
     if ($LASTEXITCODE -eq 0) {
         Write-Success "MSRV check passed"
