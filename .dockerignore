@@ -1,0 +1,24 @@
+# Build artifacts — never ship the host's target/ into the CI image.
+# (3+ GiB; the container does a clean build anyway.)
+target/
+**/target/
+
+# VCS and local tooling
+.git/
+.github/
+.vscode/
+.idea/
+
+# Large local benchmark corpora / artifacts (kept outside the repo, but guard anyway)
+silesia/
+bench-data/
+*.aet
+
+# Editor/OS cruft
+*.swp
+*~
+.DS_Store
+
+# Coverage / profiling
+*.profraw
+*.pdb

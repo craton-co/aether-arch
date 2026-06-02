@@ -275,7 +275,11 @@ pub fn byteplane_encode(data: &[u8], width: BytePlaneWidth) -> Option<Vec<u8>> {
 
     // Recompute RC flags based on what actually compressed
     let mut actual_rc_flags: u8 = 0;
-    for (i, (enc, orig)) in encoded_planes.iter().zip(maybe_delta_planes.iter()).enumerate() {
+    for (i, (enc, orig)) in encoded_planes
+        .iter()
+        .zip(maybe_delta_planes.iter())
+        .enumerate()
+    {
         if enc.len() < orig.len() && (rc_flags >> i) & 1 == 1 {
             actual_rc_flags |= 1 << i;
         }
@@ -581,14 +585,20 @@ mod tests {
     fn should_delta_on_sequential_data() {
         // Slowly changing exponent bytes — delta should help
         let data: Vec<u8> = (0..1000).map(|i| (0x3F + (i / 100)) as u8).collect();
-        assert!(should_delta(&data), "sequential data should benefit from delta");
+        assert!(
+            should_delta(&data),
+            "sequential data should benefit from delta"
+        );
     }
 
     #[test]
     fn should_delta_rejects_constant_entropy() {
         // All-same bytes: entropy is 0 either way, delta should not claim improvement
         let data = vec![42u8; 1000];
-        assert!(!should_delta(&data), "constant data should not benefit from delta");
+        assert!(
+            !should_delta(&data),
+            "constant data should not benefit from delta"
+        );
 
         // Already-uniform entropy (every byte value equally represented):
         // delta of uniform is also roughly uniform, no benefit

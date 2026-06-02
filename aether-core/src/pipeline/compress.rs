@@ -403,6 +403,11 @@ impl Compressor {
                             "Failed to apply dictionary to predictor: {e}"
                         ))
                     })?;
+                    // Stage A: also install the dictionary as the per-block
+                    // coding baseline so it actually seeds the entropy coder
+                    // (no-op for predictors that don't support it). The router
+                    // propagates this onto its internal BWT/LZ77 predictors.
+                    predictor.set_coding_baseline(&dict.state);
                 }
                 let mut results = Vec::with_capacity(group.file_indices.len());
 

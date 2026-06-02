@@ -11,7 +11,11 @@ for /f "tokens=*" %%i in ('git rev-parse --abbrev-ref HEAD') do set BRANCH=%%i
 for /f "tokens=*" %%i in ('git rev-parse --short HEAD') do set COMMIT=%%i
 
 set IMAGE_NAME=aether-ci-test
-set CONTAINER_NAME=aether-ci-%BRANCH%-%COMMIT%
+REM Docker container names allow only [a-zA-Z0-9_.-]; branch names often
+REM contain '/' (e.g. perf/foo) and '\', so sanitize them to '-'.
+set SAFE_BRANCH=%BRANCH:/=-%
+set SAFE_BRANCH=%SAFE_BRANCH:\=-%
+set CONTAINER_NAME=aether-ci-%SAFE_BRANCH%-%COMMIT%
 for /f "tokens=2-4 delims=/ " %%a in ('date /t') do (set mydate=%%c%%a%%b)
 for /f "tokens=1-2 delims=/:" %%a in ('time /t') do (set mytime=%%a%%b)
 

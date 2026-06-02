@@ -8,7 +8,9 @@ enterprise = ["aether-core/enterprise", "aether-cli/enterprise"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85.0"
+# MSRV is floored at 1.88 by a transitive dependency (tonic 0.14.6 requires
+# rustc 1.88). Verified with `cargo +1.88.0 check --workspace`.
+rust-version = "1.88.0"
 license = "Apache-2.0"
 repository = "https://github.com/craton-co/aether-arch"
 

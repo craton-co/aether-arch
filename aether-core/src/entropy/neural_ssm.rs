@@ -32,10 +32,24 @@ const D_MAX: usize = 32;
 const MIN_PROB: f32 = 1e-6;
 
 /// Number of order-2 context buckets for literal prediction.
-const NUM_O2_CTX: usize = 8;
+///
+/// Stage B: raised from 8 (4 prev-classes × 2 prev_prev-classes) to 64
+/// (8 × 8). On the BWT+MTF+RLE stream the "literals" are MTF ranks, which
+/// cluster heavily near zero, so finer conditioning on the previous two
+/// ranks sharpens the literal distribution. Pure integer counting — adds
+/// no floating-point math, so cross-platform determinism is unaffected.
+const NUM_O2_CTX: usize = 64;
 
 /// Pseudocount per literal value in order-2 model.
 const O2_ALPHA: f32 = 0.5;
+
+/// Stage B confidence constant for the order-2 literal blend. The effective
+/// blend weight is `o2_lit_blend * obs / (obs + O2_CONF_K)`, so a context
+/// reaches half its target blend after ~`O2_CONF_K` observations. This lets
+/// the finer (64-context) model defer to the global RLE distribution while a
+/// context is still sparse — fixing the regression a fixed blend caused when
+/// contexts were subdivided. Deterministic integer/f32 math only.
+const O2_CONF_K: f32 = 32.0;
 
 /// Default blend weight for order-2 literal model (0 = pure RLE, 1 = pure order-2).
 /// Tuned via greedy sweep on Silesia corpus (202 MiB, 12 files). 0.3 wins over 0.1
@@ -198,6 +212,14 @@ pub struct NeuralSsmPredictor {
     last_rle_p_runa: f32,
 
     step: u32,
+
+    /// Stage A: optional per-block reset baseline (a serialized predictor
+    /// state from a pretrained dictionary). When set, `reset()` restores
+    /// THIS state instead of zeroing — so every block starts from the
+    /// dictionary's learned distribution while remaining independently
+    /// decodable (seekability preserved). NOT part of `save_state`; it is a
+    /// coding-time seed supplied identically at encode and decode.
+    dict_baseline: Option<Vec<u8>>,
 }
 
 impl NeuralSsmPredictor {
@@ -301,7 +323,21 @@ impl NeuralSsmPredictor {
             last_rle_p_run: 0.5,
             last_rle_p_runa: 0.5,
             step: 0,
+            dict_baseline: None,
         }
+    }
+
+    /// Stage A: set a pretrained dictionary state as the per-block reset
+    /// baseline. Returns `true` if the state is valid and was applied (the
+    /// predictor is immediately reset to it); `false` leaves the predictor
+    /// unchanged. The same state must be supplied at decode time.
+    pub fn set_dict_baseline(&mut self, state: &[u8]) -> bool {
+        // Validate by loading into self; load_state commits only on success.
+        if !self.load_state(state) {
+            return false;
+        }
+        self.dict_baseline = Some(state.to_vec());
+        true
     }
 
     /// Compute SSM's binary predictions from hidden state.
@@ -317,20 +353,27 @@ impl NeuralSsmPredictor {
     }
 
     /// Hash previous two bytes into an order-2 context index for literals.
+    ///
+    /// 8 buckets per byte (64 contexts total). MTF ranks cluster near zero,
+    /// so the low ranks get exact buckets and larger ranks are grouped
+    /// logarithmically. `bucket(0..=3)` are exact; then 4-5, 6-9, 10-19, 20+.
+    #[inline]
+    fn rank_bucket(b: u8) -> usize {
+        match b {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4..=5 => 4,
+            6..=9 => 5,
+            10..=19 => 6,
+            _ => 7,
+        }
+    }
+
     fn o2_context(prev: u8, prev_prev: u8) -> usize {
-        // 4 classes for prev: run(0-1), lit_lo(2-5), lit_mid(6-15), lit_hi(16+)
-        let a = if prev <= 1 {
-            0u32
-        } else if prev <= 5 {
-            1
-        } else if prev <= 15 {
-            2
-        } else {
-            3
-        };
-        // 2 classes for prev_prev: run vs literal
-        let b = if prev_prev <= 1 { 0u32 } else { 1 };
-        (a * 2 + b) as usize
+        // 8 prev-buckets × 8 prev_prev-buckets = 64 contexts.
+        Self::rank_bucket(prev) * 8 + Self::rank_bucket(prev_prev)
     }
 
     /// Compute mixing weight alpha for the SSM component.
@@ -392,18 +435,21 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
         let inv_rle_lit = 1.0 / rle_p_lit_total;
         let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-        let o2_total = self.o2_lit_totals[o2_ctx] as f32 + 254.0 * O2_ALPHA;
+        let o2_obs = self.o2_lit_totals[o2_ctx];
+        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
         let inv_o2_total = 1.0 / o2_total;
-        let o2_blend = self.cfg.o2_lit_blend;
-        let rle_weight = 1.0 - o2_blend;
-        let use_o2 = self.o2_lit_totals[o2_ctx] >= self.cfg.o2_min_obs && o2_blend > 0.0;
+        // Confidence-weighted blend (Stage B): a sparse context defers to the
+        // global RLE distribution; influence grows with observation count.
+        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
+        let rle_weight = 1.0 - eff_blend;
+        let use_o2 = eff_blend > 0.0;
         let p_lit = 1.0 - p_run;
 
         for i in 2..256 {
             let rle_p = rle_probs[i] * inv_rle_lit;
             let lit_p = if use_o2 {
                 let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                rle_weight * rle_p + o2_blend * o2_p
+                rle_weight * rle_p + eff_blend * o2_p
             } else {
                 rle_p
             };
@@ -465,16 +511,18 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         // - materializing a separate [f32;256] intermediate for predict()
         let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
         let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-        let o2_total = self.o2_lit_totals[o2_ctx] as f32 + 254.0 * O2_ALPHA;
-        let o2_blend = self.cfg.o2_lit_blend;
-        let o2_has_data = self.o2_lit_totals[o2_ctx] >= self.cfg.o2_min_obs;
+        let o2_obs = self.o2_lit_totals[o2_ctx];
+        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
+        // Confidence-weighted blend (Stage B) — MUST match predict() exactly so
+        // the [f32;256] and direct-CDF paths agree.
+        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
 
         // First pass: compute raw probs and sum.
         // Precompute reciprocals to replace 254+ divisions with multiplies.
         let inv_rle_lit = 1.0 / rle_p_lit_total;
         let inv_o2_total = 1.0 / o2_total;
-        let rle_weight = 1.0 - o2_blend;
-        let use_o2 = o2_has_data && o2_blend > 0.0;
+        let rle_weight = 1.0 - eff_blend;
+        let use_o2 = eff_blend > 0.0;
 
         let mut raw = [0.0f32; 256];
         raw[0] = (p_run * p_runa).max(MIN_PROB);
@@ -485,7 +533,7 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
             let rle_p = rle_probs[i] * inv_rle_lit;
             let lit_p = if use_o2 {
                 let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                rle_weight * rle_p + o2_blend * o2_p
+                rle_weight * rle_p + eff_blend * o2_p
             } else {
                 rle_p
             };
@@ -495,16 +543,57 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         }
 
         // Cumulative rounding: same precision as probs_to_cdf but in f32.
+        //
+        // ── Early-exit overshoot detection ────────────────────────────
+        //
+        // On real NeuralSSM data (BWT+MTF+RLE of English text), the
+        // overshoot fallback fires on ~98.76% of bytes — measured via
+        // the `query_cdf_overshoot_rate_on_bench_corpus` diagnostic.
+        // Each overshoot wastes both the f32 cumulative-rounding sweep
+        // AND the f32 monotonicity fix-up before calling `probs_to_cdf`.
+        //
+        // Observation: overshoot is GUARANTEED whenever the rounded gap
+        // `cur - prev` is zero anywhere in the interior. The fix-up loop
+        // would then bump `cdf[i+1] = cdf[i] + 1`, and any such bump
+        // pushes `cdf[256]` past `PROB_TOTAL` (since the rounded
+        // `cdf[256]` is anchored at `PROB_TOTAL` and bumps only ever
+        // increase). So we can break out of the rounding loop the
+        // instant we see `cur <= prev` and fall straight to
+        // `probs_to_cdf` — bit-identical to running the full f32 path
+        // and then hitting the same fallback.
+        //
+        // For peaked NeuralSSM distributions this typically triggers at
+        // i ≈ 3..10 (just past the RUNA/RUNB peak), so we skip ~250
+        // iterations of pass 2 + all 256 of pass 3 on every overshoot
+        // byte. The `predict_cdf_early_exit_microbench` test measures a
+        // **+19.08% speedup (1.24x)** on the BWT-encoded English corpus
+        // the `compress_ssm` criterion bench uses, with bit-identity to
+        // the reference verified by `predict_cdf_early_exit_matches_reference`.
         let scale = PROB_TOTAL as f32 / sum;
         let mut cdf = [0u16; 257];
         let mut cum = 0.0f32;
+        let mut prev: u16 = 0;
         for i in 0..256 {
-            cdf[i] = (cum * scale + 0.5) as u16;
+            let cur = (cum * scale + 0.5) as u16;
+            // i > 0 because cdf[0] = 0 by initialization and the first
+            // rounded value (i=0) is also 0 — the `<=` would trigger
+            // spuriously. From i=1 onward, `cur <= prev` means a zero
+            // rounded gap → fix-up will bump → overshoot guaranteed.
+            if i > 0 && cur <= prev {
+                return crate::coding::rans::probs_to_cdf(&raw);
+            }
+            cdf[i] = cur;
+            prev = cur;
             cum += raw[i];
         }
         cdf[256] = PROB_TOTAL as u16;
 
-        // Ensure strict monotonicity.
+        // Ensure strict monotonicity. With the early-exit above, all
+        // interior gaps are guaranteed >= 1, so the only entry the
+        // fix-up can touch is cdf[256] (when cdf[255] rounds up to
+        // PROB_TOTAL on a floating-point boundary). We still need this
+        // loop for that edge case, but it's a no-op for indices 0..255
+        // in the hot path.
         for i in 0..256 {
             if cdf[i + 1] <= cdf[i] {
                 cdf[i + 1] = cdf[i] + 1;
@@ -605,6 +694,16 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
     }
 
     fn reset(&mut self) {
+        // Stage A: if a dictionary baseline is set, restore THAT state so
+        // every block starts from the pretrained distribution. We clone the
+        // bytes first to avoid borrowing self while load_state mutates it;
+        // the baseline was validated in set_dict_baseline, so this succeeds.
+        if let Some(baseline) = self.dict_baseline.clone() {
+            let ok = self.load_state(&baseline);
+            debug_assert!(ok, "dict_baseline was validated on set, must reload");
+            // load_state does not touch dict_baseline, so it persists.
+            return;
+        }
         // Zero only mutable state in-place. Deterministic fields (cfg, a, a_inv,
         // embed) are pure functions of config and never need recomputation.
         // This avoids 2 Box re-allocations and 8192 det_hash() calls per reset.
@@ -628,6 +727,14 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         self.last_rle_p_runa = 0.5;
         self.step = 0;
         self.rle.reset();
+    }
+
+    fn coding_baseline(&self) -> Option<&[u8]> {
+        self.dict_baseline.as_deref()
+    }
+
+    fn set_coding_baseline(&mut self, state: &[u8]) -> bool {
+        self.set_dict_baseline(state)
     }
 
     fn name(&self) -> &str {
@@ -772,10 +879,16 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
             None => return false,
         };
 
+        // Layout MUST match save_state: all counts (NUM_O2_CTX * 254) as one
+        // contiguous block, THEN all totals (NUM_O2_CTX) as a second block.
+        // (Prior to the fix, load read these interleaved per-context, which
+        // silently corrupted every dictionary whose contexts weren't all
+        // empty — the consistency check below would reject a context's total
+        // read from the next context's first count.)
         let mut o2_lit_counts = [[0u32; 254]; NUM_O2_CTX];
         let mut o2_lit_totals = [0u32; NUM_O2_CTX];
+        let mut computed_totals = [0u64; NUM_O2_CTX];
         for ctx in 0..NUM_O2_CTX {
-            let mut computed_total: u64 = 0;
             for lit_count in o2_lit_counts[ctx].iter_mut() {
                 let c = match read_u32(data, &mut off) {
                     Some(v) => v,
@@ -785,14 +898,18 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
                     return false; // Reject adversarially large counts
                 }
                 *lit_count = c;
-                computed_total += c as u64;
+                computed_totals[ctx] += c as u64;
             }
+        }
+        for ctx in 0..NUM_O2_CTX {
             o2_lit_totals[ctx] = match read_u32(data, &mut off) {
                 Some(v) => v,
                 None => return false,
             };
             // Validate totals are consistent with counts
-            if computed_total > u32::MAX as u64 || o2_lit_totals[ctx] != computed_total as u32 {
+            if computed_totals[ctx] > u32::MAX as u64
+                || o2_lit_totals[ctx] != computed_totals[ctx] as u32
+            {
                 return false;
             }
         }
@@ -847,8 +964,199 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
 }
 
 #[cfg(test)]
+impl NeuralSsmPredictor {
+    /// Reference implementation of `predict_cdf` WITHOUT the early-exit
+    /// overshoot detection — used by the microbench and bit-identity
+    /// tests to validate the production version above. Test-only; never
+    /// called from compress/decompress paths.
+    pub(crate) fn predict_cdf_no_early_exit(&mut self) -> [u16; 257] {
+        use crate::coding::rans::PROB_TOTAL;
+
+        // Replay pass 1 (compute raw[], sum) IDENTICALLY to predict_cdf
+        // above — including the state writes to last_* and the
+        // ssm_binary_predict() side effects, since both paths are
+        // expected to leave the predictor in the same post-predict
+        // state. The bit-identity test relies on this.
+        let rle_probs = self.rle.predict();
+        self.last_rle_probs = rle_probs;
+
+        let rle_p_run = rle_probs[0] + rle_probs[1];
+        let rle_p_runa = if rle_p_run > MIN_PROB {
+            rle_probs[0] / rle_p_run
+        } else {
+            0.5
+        };
+        self.last_rle_p_run = rle_p_run;
+        self.last_rle_p_runa = rle_p_runa;
+
+        let (ssm_p_run, ssm_p_runa) = self.ssm_binary_predict();
+        self.last_ssm_p_run = ssm_p_run;
+        self.last_ssm_p_runa = ssm_p_runa;
+
+        let alpha = self.mixing_alpha();
+        let beta = 1.0 - alpha;
+        let p_run = alpha * ssm_p_run + beta * rle_p_run;
+        let p_runa = alpha * ssm_p_runa + beta * rle_p_runa;
+
+        let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
+        let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
+        let o2_obs = self.o2_lit_totals[o2_ctx];
+        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
+        // Must mirror predict_cdf()'s confidence-weighted blend exactly.
+        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
+
+        let inv_rle_lit = 1.0 / rle_p_lit_total;
+        let inv_o2_total = 1.0 / o2_total;
+        let rle_weight = 1.0 - eff_blend;
+        let use_o2 = eff_blend > 0.0;
+
+        let mut raw = [0.0f32; 256];
+        raw[0] = (p_run * p_runa).max(MIN_PROB);
+        raw[1] = (p_run * (1.0 - p_runa)).max(MIN_PROB);
+        let p_lit = 1.0 - p_run;
+        let mut sum = raw[0] + raw[1];
+        for i in 2..256 {
+            let rle_p = rle_probs[i] * inv_rle_lit;
+            let lit_p = if use_o2 {
+                let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
+                rle_weight * rle_p + eff_blend * o2_p
+            } else {
+                rle_p
+            };
+            let p = (p_lit * lit_p).max(MIN_PROB);
+            raw[i] = p;
+            sum += p;
+        }
+
+        // Pass 2-3 WITHOUT early-exit — full sweeps, then check overshoot
+        // at the end. This is the structure the original predict_cdf had
+        // before the early-exit optimization was added.
+        let scale = PROB_TOTAL as f32 / sum;
+        let mut cdf = [0u16; 257];
+        let mut cum = 0.0f32;
+        for i in 0..256 {
+            cdf[i] = (cum * scale + 0.5) as u16;
+            cum += raw[i];
+        }
+        cdf[256] = PROB_TOTAL as u16;
+        for i in 0..256 {
+            if cdf[i + 1] <= cdf[i] {
+                cdf[i + 1] = cdf[i] + 1;
+            }
+        }
+        if cdf[256] != PROB_TOTAL as u16 {
+            return crate::coding::rans::probs_to_cdf(&raw);
+        }
+        cdf
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bit-identity guard: the early-exit `predict_cdf` must produce the
+    /// exact same CDF as the reference implementation at every step of a
+    /// real RLE-shaped byte stream. Catches regressions where the
+    /// early-exit predicate would diverge from the post-fix-up overshoot
+    /// check (e.g. boundary-rounding edge cases).
+    #[test]
+    fn predict_cdf_early_exit_matches_reference() {
+        // Use the same bias as roundtrip_with_range_coder: heavy RUNA/RUNB
+        // distribution that drives the overshoot path on essentially
+        // every byte.
+        let mut data = Vec::with_capacity(4096);
+        let mut state = 0x9e37_79b9u32;
+        for _ in 0..4096 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let b = match (state >> 24) & 0x7 {
+                0..=3 => 0,
+                4 => 1,
+                _ => ((state >> 8) & 0xFF) as u8,
+            };
+            data.push(b);
+        }
+
+        let mut early = NeuralSsmPredictor::new();
+        let mut reference = NeuralSsmPredictor::new();
+        for (step, &byte) in data.iter().enumerate() {
+            let cdf_early = early.predict_cdf();
+            let cdf_ref = reference.predict_cdf_no_early_exit();
+            assert_eq!(
+                cdf_early, cdf_ref,
+                "CDF diverged at step {step} (byte={byte})"
+            );
+            early.update(byte);
+            reference.update(byte);
+        }
+    }
+
+    /// Microbench: measure the speedup from the early-exit overshoot
+    /// detection on the same BWT-encoded English corpus the criterion
+    /// `compress_ssm` bench uses. Run with `--ignored --nocapture` to
+    /// see numbers. Repeatable (tight loop, no harness noise).
+    #[test]
+    #[ignore]
+    #[cfg(feature = "bwt-encode")]
+    fn predict_cdf_early_exit_microbench() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("large");
+        let text = match std::fs::read(dir.join("english.txt")) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("[microbench] fixture missing, skipping");
+                return;
+            }
+        };
+        let bwt_data = match crate::coding::bwt_preprocess::bwt_mtf_encode(&text) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        eprintln!("[microbench] corpus: {} bytes", bwt_data.len());
+
+        // Reference first (no early exit), then optimized. Cache is warm
+        // for both — the bench corpus fits in L3.
+        let mut pred_ref = NeuralSsmPredictor::new();
+        let mut sample_ref = 0u64;
+        let start = std::time::Instant::now();
+        for &byte in &bwt_data {
+            let cdf = pred_ref.predict_cdf_no_early_exit();
+            sample_ref = sample_ref.wrapping_add(cdf[byte as usize] as u64);
+            pred_ref.update(byte);
+        }
+        let ref_time = start.elapsed();
+
+        let mut pred_opt = NeuralSsmPredictor::new();
+        let mut sample_opt = 0u64;
+        let start = std::time::Instant::now();
+        for &byte in &bwt_data {
+            let cdf = pred_opt.predict_cdf();
+            sample_opt = sample_opt.wrapping_add(cdf[byte as usize] as u64);
+            pred_opt.update(byte);
+        }
+        let opt_time = start.elapsed();
+
+        // The samples should match — bit-identity proven again.
+        assert_eq!(
+            sample_ref, sample_opt,
+            "predict_cdf diverged from reference"
+        );
+
+        let ref_mbps = bwt_data.len() as f64 / ref_time.as_secs_f64() / (1024.0 * 1024.0);
+        let opt_mbps = bwt_data.len() as f64 / opt_time.as_secs_f64() / (1024.0 * 1024.0);
+        let delta = (1.0 - opt_time.as_secs_f64() / ref_time.as_secs_f64()) * 100.0;
+        let speedup = ref_time.as_secs_f64() / opt_time.as_secs_f64();
+        eprintln!("[reference   ] {:?}  ({:.3} MiB/s)", ref_time, ref_mbps);
+        eprintln!("[early-exit  ] {:?}  ({:.3} MiB/s)", opt_time, opt_mbps);
+        eprintln!(
+            "[delta] early-exit is {:+.2}% faster (speedup {:.3}x)",
+            delta, speedup
+        );
+    }
 
     #[test]
     fn starts_near_uniform() {
@@ -980,26 +1288,139 @@ mod tests {
         assert_eq!(pred.b_runa, fresh.b_runa, "b_runa mismatch");
         assert_eq!(pred.ssm_perf, fresh.ssm_perf, "ssm_perf mismatch");
         assert_eq!(pred.rle_perf, fresh.rle_perf, "rle_perf mismatch");
-        assert_eq!(pred.o2_lit_totals, fresh.o2_lit_totals, "o2_lit_totals mismatch");
+        assert_eq!(
+            pred.o2_lit_totals, fresh.o2_lit_totals,
+            "o2_lit_totals mismatch"
+        );
         assert_eq!(pred.prev_byte, fresh.prev_byte, "prev_byte mismatch");
-        assert_eq!(pred.prev_prev_byte, fresh.prev_prev_byte, "prev_prev_byte mismatch");
-        assert_eq!(pred.last_rle_probs, fresh.last_rle_probs, "last_rle_probs mismatch");
-        assert_eq!(pred.last_ssm_p_run, fresh.last_ssm_p_run, "last_ssm_p_run mismatch");
-        assert_eq!(pred.last_ssm_p_runa, fresh.last_ssm_p_runa, "last_ssm_p_runa mismatch");
-        assert_eq!(pred.last_rle_p_run, fresh.last_rle_p_run, "last_rle_p_run mismatch");
-        assert_eq!(pred.last_rle_p_runa, fresh.last_rle_p_runa, "last_rle_p_runa mismatch");
+        assert_eq!(
+            pred.prev_prev_byte, fresh.prev_prev_byte,
+            "prev_prev_byte mismatch"
+        );
+        assert_eq!(
+            pred.last_rle_probs, fresh.last_rle_probs,
+            "last_rle_probs mismatch"
+        );
+        assert_eq!(
+            pred.last_ssm_p_run, fresh.last_ssm_p_run,
+            "last_ssm_p_run mismatch"
+        );
+        assert_eq!(
+            pred.last_ssm_p_runa, fresh.last_ssm_p_runa,
+            "last_ssm_p_runa mismatch"
+        );
+        assert_eq!(
+            pred.last_rle_p_run, fresh.last_rle_p_run,
+            "last_rle_p_run mismatch"
+        );
+        assert_eq!(
+            pred.last_rle_p_runa, fresh.last_rle_p_runa,
+            "last_rle_p_runa mismatch"
+        );
         assert_eq!(pred.step, fresh.step, "step mismatch");
-        assert_eq!(*pred.o2_lit_counts, *fresh.o2_lit_counts, "o2_lit_counts mismatch");
+        assert_eq!(
+            *pred.o2_lit_counts, *fresh.o2_lit_counts,
+            "o2_lit_counts mismatch"
+        );
 
         // Prediction equivalence: feed same stream to both, verify identical output
         let stream: Vec<u8> = (0..100).map(|i| (i % 5) as u8).collect();
         for &b in &stream {
             let p1 = pred.predict();
             let p2 = fresh.predict();
-            assert_eq!(p1, p2, "Prediction diverged after reset at step {}", pred.step);
+            assert_eq!(
+                p1, p2,
+                "Prediction diverged after reset at step {}",
+                pred.step
+            );
             pred.update(b);
             fresh.update(b);
         }
+    }
+
+    #[test]
+    fn save_load_state_roundtrip_preserves_predictions() {
+        // Train on varied data so multiple order-2 contexts are non-empty.
+        // Empty contexts (the previous tests' regime) hid the counts/totals
+        // block-vs-interleaved layout bug because 0 == 0 always validated.
+        let mut pred = NeuralSsmPredictor::new();
+        let training: Vec<u8> = (0..5000u32)
+            .map(|i| ((i * 31 + i / 7) % 256) as u8)
+            .collect();
+        for &b in &training {
+            pred.predict();
+            pred.update(b);
+        }
+
+        let state = pred.save_state().expect("ssm supports save_state");
+        let mut loaded = NeuralSsmPredictor::new();
+        assert!(
+            loaded.load_state(&state),
+            "load_state must accept its own save_state output"
+        );
+
+        // Learned tables must survive the round-trip exactly.
+        assert_eq!(pred.o2_lit_totals, loaded.o2_lit_totals, "o2_lit_totals");
+        assert_eq!(*pred.o2_lit_counts, *loaded.o2_lit_counts, "o2_lit_counts");
+        assert_eq!(pred.w_run, loaded.w_run, "w_run");
+        assert_eq!(pred.w_runa, loaded.w_runa, "w_runa");
+        assert_eq!(pred.step, loaded.step, "step");
+
+        // Behavioral equality: predict() before update() on both so the
+        // cached last_* fields are set identically each step.
+        let stream: Vec<u8> = (0..300u32).map(|i| (i % 256) as u8).collect();
+        for &b in &stream {
+            assert_eq!(
+                pred.predict(),
+                loaded.predict(),
+                "prediction diverged after save/load at step {}",
+                pred.step
+            );
+            pred.update(b);
+            loaded.update(b);
+        }
+    }
+
+    #[test]
+    fn reset_restores_dict_baseline_not_zero() {
+        // Build a representative baseline by training, then capture it.
+        let training: Vec<u8> = (0..3000u32)
+            .map(|i| ((i * 7 + i / 3) % 256) as u8)
+            .collect();
+        let mut trained = NeuralSsmPredictor::new();
+        for &b in &training {
+            trained.predict();
+            trained.update(b);
+        }
+        let baseline = trained.save_state().unwrap();
+
+        // Installing the baseline immediately sets state to it.
+        let mut pred = NeuralSsmPredictor::new();
+        assert!(pred.set_dict_baseline(&baseline));
+        assert_eq!(pred.save_state().unwrap(), baseline);
+        assert_eq!(pred.coding_baseline(), Some(baseline.as_slice()));
+
+        // Dirty the state, then reset() must restore the BASELINE, not zero.
+        for &b in b"completely different bytes 12345" {
+            pred.predict();
+            pred.update(b);
+        }
+        pred.reset();
+        assert_eq!(
+            pred.save_state().unwrap(),
+            baseline,
+            "reset() with a dict baseline must restore the baseline, not zero"
+        );
+
+        // Without a baseline, reset() returns to the fresh (zeroed) state.
+        let mut plain = NeuralSsmPredictor::new();
+        plain.update(5);
+        plain.reset();
+        assert_eq!(
+            plain.save_state().unwrap(),
+            NeuralSsmPredictor::new().save_state().unwrap(),
+            "reset() without a baseline must zero the state"
+        );
     }
 
     #[test]

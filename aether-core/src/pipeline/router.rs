@@ -65,6 +65,13 @@ pub fn compress_chunk(
             // call, so state from a failed trial never bleeds into the next.
             // Saves 2 heap allocations (~25 KiB each) per chunk.
             let mut scratch = NeuralSsmPredictor::new();
+            // Stage A: if the configured predictor carries a dictionary
+            // baseline (only NeuralSSM does), propagate it so the BWT/LZ77/
+            // plain coding starts each block from the pretrained distribution.
+            // decode mirrors this in decompress_chunk via the same dictionary.
+            if let Some(baseline) = predictor.coding_baseline() {
+                scratch.set_dict_baseline(baseline);
+            }
 
             // ── Try byte-plane splitting (numeric data fast path) ────
             // For NumericData content, try byte-plane first and skip
@@ -344,6 +351,12 @@ pub fn decompress_chunk(
             let rc_bytes = &compressed_data[9..];
 
             let mut bwt_predictor = NeuralSsmPredictor::new();
+            // Stage A: mirror the encoder — seed the BWT decode predictor with
+            // the same dictionary baseline the encoder used, so reset() (called
+            // inside decode_block) restores the identical starting state.
+            if let Some(baseline) = predictor.coding_baseline() {
+                bwt_predictor.set_dict_baseline(baseline);
+            }
             let encode_data = rans::decode_block(rc_bytes, encoded_len, &mut bwt_predictor)?;
 
             // Undo RLE if applied, then undo BWT+MTF

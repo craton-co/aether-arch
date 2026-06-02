@@ -79,6 +79,62 @@ impl Dictionary {
         })
     }
 
+    /// Train a dictionary on the BWT+MTF+RLE-transformed stream (Stage A).
+    ///
+    /// The high-ratio coding path (BwtPredictorRans) feeds its NeuralSSM the
+    /// *transformed* stream — MTF ranks + RUNA/RUNB — not raw bytes. A
+    /// dictionary used as that path's per-block reset baseline must therefore
+    /// be trained on the same representation, or it seeds the wrong
+    /// distribution. This mirrors the router's chunk → BWT+MTF → RLE pipeline
+    /// (including the high-entropy BWT skip) and accumulates state across the
+    /// whole corpus without resetting, producing a "warmed" baseline.
+    pub fn train_transformed(
+        predictor: &mut dyn ProbabilityPredictor,
+        training_files: &[impl AsRef<Path>],
+    ) -> Result<Self> {
+        use crate::chunker;
+        use crate::coding::bwt_preprocess;
+        // Matches router::compress_chunk's BWT_ENTROPY_SKIP.
+        const BWT_ENTROPY_SKIP: f64 = 6.5;
+        for path in training_files {
+            let data = std::fs::read(path.as_ref())?;
+            let chunks = if data.len() < chunker::MIN_CHUNK_SIZE as usize {
+                chunker::chunk_fixed(&data, chunker::AVG_CHUNK_SIZE as usize)
+            } else {
+                chunker::chunk_data(&data)
+            };
+            for chunk in &chunks {
+                if chunk.data.len() < 8 || chunk.entropy >= BWT_ENTROPY_SKIP {
+                    continue;
+                }
+                let Ok((_primary_index, mtf_data)) =
+                    bwt_preprocess::bwt_mtf_encode_parts(&chunk.data)
+                else {
+                    continue;
+                };
+                let stream = bwt_preprocess::rle_encode(&mtf_data).unwrap_or(mtf_data);
+                for &byte in &stream {
+                    predictor.predict();
+                    predictor.update(byte);
+                }
+            }
+        }
+
+        let state = predictor.save_state().ok_or_else(|| {
+            AetherError::Compression(format!(
+                "Predictor '{}' does not support dictionary pretraining",
+                predictor.name(),
+            ))
+        })?;
+        let hash = *blake3::hash(&state).as_bytes();
+        let predictor_id = predictor.predictor_id();
+        Ok(Dictionary {
+            predictor_id,
+            state,
+            hash,
+        })
+    }
+
     /// Save the dictionary to a file (.aed format).
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut f = std::fs::File::create(path)?;

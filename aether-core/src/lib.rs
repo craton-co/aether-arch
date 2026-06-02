@@ -19,6 +19,7 @@
 pub mod analyzer;
 pub mod archive;
 pub mod block;
+pub mod builtin_dicts;
 pub mod chunker;
 #[cfg(feature = "cloud")]
 pub mod cloud;

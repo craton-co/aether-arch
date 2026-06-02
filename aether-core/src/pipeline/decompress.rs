@@ -192,6 +192,10 @@ impl Decompressor {
             dict.apply(predictor.as_mut()).map_err(|e| {
                 AetherError::Decompression(format!("Failed to apply dictionary to predictor: {e}"))
             })?;
+            // Stage A: install the same per-block coding baseline the encoder
+            // used, so the router's BWT/LZ77 decode predictors reset to the
+            // identical starting state. Symmetric with compress's compress_group.
+            predictor.set_coding_baseline(&dict.state);
         }
         Ok(predictor)
     }

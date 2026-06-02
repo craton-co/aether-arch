@@ -1,6 +1,11 @@
 #!/usr/bin/env pwsh
 # AetherArch Local CI Test Runner using Docker
 # Runs all GitHub Actions CI jobs in Docker containers (Cross-platform)
+#
+# NOTE: This script is intentionally ASCII-only. Windows PowerShell 5.1 reads
+# BOM-less .ps1 files in the system ANSI codepage, so non-ASCII characters
+# (box-drawing, arrows, check marks) get corrupted and break parsing on
+# non-UTF-8 consoles. Keep it ASCII.
 
 $ErrorActionPreference = "Stop"
 
@@ -11,7 +16,10 @@ $Branch = git rev-parse --abbrev-ref HEAD 2>$null
 $Commit = git rev-parse --short HEAD 2>$null
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $ImageName = "aether-ci-test"
-$ContainerName = "aether-ci-$Branch-$Commit"
+# Docker object names allow only [a-zA-Z0-9_.-]; branch names often contain
+# '/' (e.g. perf/foo), so sanitize before using in a container name.
+$SafeBranch = ($Branch -replace '[^a-zA-Z0-9_.-]', '-')
+$ContainerName = "aether-ci-$SafeBranch-$Commit"
 
 # Color codes for output
 function Write-ColorOutput($ForegroundColor) {
@@ -24,28 +32,28 @@ function Write-ColorOutput($ForegroundColor) {
 }
 
 function Write-Header {
-    Write-ColorOutput Cyan "╔════════════════════════════════════════════════════════════╗"
-    Write-ColorOutput Cyan "║           AetherArch Local CI Test Runner                   ║"
-    Write-ColorOutput Cyan "╚════════════════════════════════════════════════════════════╝"
+    Write-ColorOutput Cyan "================================================================"
+    Write-ColorOutput Cyan "           AetherArch Local CI Test Runner"
+    Write-ColorOutput Cyan "================================================================"
     Write-Output ""
 }
 
 function Write-Section($Message) {
-    Write-ColorOutput Cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    Write-ColorOutput Cyan "→ $Message"
-    Write-ColorOutput Cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    Write-ColorOutput Cyan "----------------------------------------------------------------"
+    Write-ColorOutput Cyan "-> $Message"
+    Write-ColorOutput Cyan "----------------------------------------------------------------"
 }
 
 function Write-Success($Message) {
-    Write-ColorOutput Green "✓ $Message"
+    Write-ColorOutput Green "[OK] $Message"
 }
 
 function Write-Error($Message) {
-    Write-ColorOutput Red "✗ $Message"
+    Write-ColorOutput Red "[X] $Message"
 }
 
 function Write-Info($Message) {
-    Write-ColorOutput Yellow "ℹ $Message"
+    Write-ColorOutput Yellow "[i] $Message"
 }
 
 Write-Header
@@ -98,7 +106,7 @@ Write-Output ""
 # Build Docker image
 Write-Section "Building Docker Image"
 Write-Info "Building image: $ImageName"
-Write-Info "Command: docker build -f Dockerfile.ci -t $Image_NAME ."
+Write-Info "Command: docker build -f Dockerfile.ci -t $ImageName ."
 Write-Output ""
 
 $BuildArgs = @("build", "-f", "Dockerfile.ci", "-t", $ImageName, ".")
@@ -203,11 +211,11 @@ function Test-Doc {
 }
 
 function Test-MSRV {
-    Write-Section "6. MSRV Check (Rust 1.85.0)"
-    Write-Info "Command: cargo +1.85.0 check --workspace"
+    Write-Section "6. MSRV Check (Rust 1.88.0)"
+    Write-Info "Command: cargo +1.88.0 check --workspace"
     $RunArgs = @("run", "--rm", "--name", "$ContainerName-msrv", "--cpus", "4", "--memory", "8g",
                  "-v", "${ProjectRoot}:/workspace", "-w", "/workspace", $ImageName,
-                 "bash", "-c", "rustup install 1.85.0 && cargo +1.85.0 check --workspace")
+                 "bash", "-c", "rustup install 1.88.0 && cargo +1.88.0 check --workspace")
     & docker @RunArgs
     if ($LASTEXITCODE -eq 0) {
         Write-Success "MSRV check passed"
@@ -224,13 +232,13 @@ $Results = @{}
 if ($RunAll) {
     Write-Section "Running All CI Tests"
     Write-Output ""
-    
+
     # First run the full CI pipeline from Dockerfile CMD
     Write-Info "Running full CI pipeline from Dockerfile..."
     $RunArgs = @("run", "--rm", "--name", $ContainerName, "--cpus", "4", "--memory", "8g",
                  "-v", "${ProjectRoot}:/workspace", $ImageName)
     & docker @RunArgs
-    
+
     if ($LASTEXITCODE -eq 0) {
         Write-Success "Full CI pipeline passed"
         $Results["Build"] = $true
@@ -242,7 +250,7 @@ if ($RunAll) {
     } else {
         Write-Error "Full CI pipeline failed, running individual tests..."
         Write-Output ""
-        
+
         # Run individual tests for detailed reporting
         $Results["Build"] = Test-Build
         Write-Output ""
@@ -290,23 +298,23 @@ foreach ($Key in $Results.Keys) {
 Write-Output ""
 
 if ($AllPassed) {
-    Write-ColorOutput Green "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    Write-ColorOutput Green "✓ All CI checks passed successfully!"
-    Write-ColorOutput Green "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    Write-ColorOutput Green "----------------------------------------------------------------"
+    Write-ColorOutput Green "[OK] All CI checks passed successfully!"
+    Write-ColorOutput Green "----------------------------------------------------------------"
     Write-Output ""
     Write-Output "Next Steps:"
     Write-Output "  1. Commit and push to branch: git push origin $Branch"
     Write-Output "  2. Create a pull request to main"
     Write-Output "  3. GitHub Actions will run additional platform tests:"
-    Write-Output "     • Ubuntu (Linux)"
-    Write-Output "     • Windows"
-    Write-Output "     • macOS"
+    Write-Output "     - Ubuntu (Linux)"
+    Write-Output "     - Windows"
+    Write-Output "     - macOS"
     Write-Output ""
     exit 0
 } else {
-    Write-ColorOutput Red "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    Write-ColorOutput Red "✗ Some CI checks failed!"
-    Write-ColorOutput Red "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    Write-ColorOutput Red "----------------------------------------------------------------"
+    Write-ColorOutput Red "[X] Some CI checks failed!"
+    Write-ColorOutput Red "----------------------------------------------------------------"
     Write-Output ""
     Write-Output "Please fix the failing tests above before pushing."
     Write-Output ""
