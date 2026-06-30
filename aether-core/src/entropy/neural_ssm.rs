@@ -126,21 +126,36 @@ fn det_hash(seed: u32) -> f32 {
     mantissa_bits / 4_194_304.0 - 1.0 // [0, 2.0) - 1.0 = [-1.0, 1.0)
 }
 
-/// Logistic sigmoid function.
+const SIGMOID_MIN: f32 = -20.0;
+const SIGMOID_MAX: f32 = 20.0;
+const SIGMOID_STEPS_PER_UNIT: usize = 256;
+const SIGMOID_LUT_LEN: usize = ((SIGMOID_MAX - SIGMOID_MIN) as usize * SIGMOID_STEPS_PER_UNIT) + 1;
+
+/// Logistic sigmoid lookup table.
 ///
-/// # Portability
-///
-/// `f32::exp()` is implemented by the platform's math library and can differ
-/// across architectures (x86 vs ARM vs WASM) by 1-2 ULP. This means
-/// NeuralSsmPredictor predictions are **not guaranteed bit-identical across
-/// platforms**. For cross-platform deterministic archives, prefer
-/// [`RlePredictor`] or [`Order0Model`] which use only integer arithmetic
-/// for their core models.
+/// The expensive `exp()` calls happen once during process initialization.
+/// Hot-path predictions use a 1/256-step table with linear interpolation,
+/// retaining close agreement with the exact logistic curve without calling
+/// the platform math library for every encoded or decoded byte.
+static SIGMOID_LUT: std::sync::LazyLock<Box<[f32]>> = std::sync::LazyLock::new(|| {
+    (0..SIGMOID_LUT_LEN)
+        .map(|index| {
+            let x = SIGMOID_MIN + index as f32 / SIGMOID_STEPS_PER_UNIT as f32;
+            1.0 / (1.0 + (-x).exp())
+        })
+        .collect()
+});
+
 #[inline]
 fn sigmoid(x: f32) -> f32 {
-    // Clamp input to avoid exp overflow (exp(88) > f32::MAX).
-    let clamped = x.clamp(-20.0, 20.0);
-    1.0 / (1.0 + (-clamped).exp())
+    let scaled = (x.clamp(SIGMOID_MIN, SIGMOID_MAX) - SIGMOID_MIN) * SIGMOID_STEPS_PER_UNIT as f32;
+    let index = scaled as usize;
+    if index + 1 >= SIGMOID_LUT_LEN {
+        return SIGMOID_LUT[SIGMOID_LUT_LEN - 1];
+    }
+    let fraction = scaled - index as f32;
+    let lo = SIGMOID_LUT[index];
+    lo + (SIGMOID_LUT[index + 1] - lo) * fraction
 }
 
 /// Fast natural logarithm approximation (max error ~0.1%).
@@ -389,6 +404,70 @@ impl NeuralSsmPredictor {
         }
         (diff * self.cfg.mix_sensitivity).min(self.cfg.max_alpha)
     }
+
+    /// Build the clamped, unnormalized symbol weights shared by the encoder
+    /// interval query and decoder CDF paths.
+    #[inline]
+    fn model_weights(&mut self) -> ([f32; 256], f32) {
+        let rle_probs = self.rle.predict();
+        self.last_rle_probs = rle_probs;
+
+        let rle_p_run = rle_probs[0] + rle_probs[1];
+        let rle_p_runa = if rle_p_run > MIN_PROB {
+            rle_probs[0] / rle_p_run
+        } else {
+            0.5
+        };
+        self.last_rle_p_run = rle_p_run;
+        self.last_rle_p_runa = rle_p_runa;
+
+        let (ssm_p_run, ssm_p_runa) = self.ssm_binary_predict();
+        self.last_ssm_p_run = ssm_p_run;
+        self.last_ssm_p_runa = ssm_p_runa;
+
+        let alpha = self.mixing_alpha();
+        let p_run = alpha * ssm_p_run + (1.0 - alpha) * rle_p_run;
+        let p_runa = alpha * ssm_p_runa + (1.0 - alpha) * rle_p_runa;
+
+        let inv_rle_lit = 1.0 / (1.0 - rle_p_run).max(MIN_PROB);
+        let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
+        let o2_obs = self.o2_lit_totals[o2_ctx];
+        let inv_o2_total = 1.0 / (o2_obs as f32 + 254.0 * O2_ALPHA);
+        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
+        let rle_weight = 1.0 - eff_blend;
+        let use_o2 = eff_blend > 0.0;
+
+        let mut weights = [0.0f32; 256];
+        weights[0] = (p_run * p_runa).max(MIN_PROB);
+        weights[1] = (p_run * (1.0 - p_runa)).max(MIN_PROB);
+        let p_lit = 1.0 - p_run;
+        let mut sum = weights[0] + weights[1];
+
+        for i in 2..256 {
+            let rle_p = rle_probs[i] * inv_rle_lit;
+            let lit_p = if use_o2 {
+                let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
+                rle_weight * rle_p + eff_blend * o2_p
+            } else {
+                rle_p
+            };
+            let weight = (p_lit * lit_p).max(MIN_PROB);
+            weights[i] = weight;
+            sum += weight;
+        }
+
+        (weights, sum)
+    }
+
+    /// Quantize cumulative mass while reserving one count per symbol.
+    #[inline]
+    fn quantized_boundary(cumulative: f64, total: f64, symbol_index: usize) -> u16 {
+        use crate::coding::rans::PROB_TOTAL;
+        const RESERVED: u32 = 256;
+        let scalable = PROB_TOTAL - RESERVED;
+        let value = symbol_index as u32 + (cumulative * scalable as f64 / total).floor() as u32;
+        value.min(PROB_TOTAL) as u16
+    }
 }
 
 impl Default for NeuralSsmPredictor {
@@ -400,68 +479,7 @@ impl Default for NeuralSsmPredictor {
 impl ProbabilityPredictor for NeuralSsmPredictor {
     #[inline]
     fn predict(&mut self) -> [f32; 256] {
-        // 1. Get RLE baseline prediction
-        let rle_probs = self.rle.predict();
-        self.last_rle_probs = rle_probs;
-
-        // 2. Extract RLE's binary decisions
-        let rle_p_run = rle_probs[0] + rle_probs[1];
-        let rle_p_runa = if rle_p_run > MIN_PROB {
-            rle_probs[0] / rle_p_run
-        } else {
-            0.5
-        };
-        self.last_rle_p_run = rle_p_run;
-        self.last_rle_p_runa = rle_p_runa;
-
-        // 3. Get SSM's binary predictions
-        let (ssm_p_run, ssm_p_runa) = self.ssm_binary_predict();
-        self.last_ssm_p_run = ssm_p_run;
-        self.last_ssm_p_runa = ssm_p_runa;
-
-        // 4. Mix binary decisions
-        let alpha = self.mixing_alpha();
-        let beta = 1.0 - alpha;
-        let p_run = alpha * ssm_p_run + beta * rle_p_run;
-        let p_runa = alpha * ssm_p_runa + beta * rle_p_runa;
-
-        // 5. Build final distribution
-        let mut probs = [0.0f32; 256];
-        probs[0] = p_run * p_runa;
-        probs[1] = p_run * (1.0 - p_runa);
-
-        // Literal distribution: blend RLE global counts with order-2 context model
-        // Precompute reciprocals to replace 254+ divisions with multiplies.
-        let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
-        let inv_rle_lit = 1.0 / rle_p_lit_total;
-        let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-        let o2_obs = self.o2_lit_totals[o2_ctx];
-        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
-        let inv_o2_total = 1.0 / o2_total;
-        // Confidence-weighted blend (Stage B): a sparse context defers to the
-        // global RLE distribution; influence grows with observation count.
-        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
-        let rle_weight = 1.0 - eff_blend;
-        let use_o2 = eff_blend > 0.0;
-        let p_lit = 1.0 - p_run;
-
-        for i in 2..256 {
-            let rle_p = rle_probs[i] * inv_rle_lit;
-            let lit_p = if use_o2 {
-                let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                rle_weight * rle_p + eff_blend * o2_p
-            } else {
-                rle_p
-            };
-            probs[i] = p_lit * lit_p;
-        }
-
-        // 6. Clamp minimums and renormalize
-        let mut sum = 0.0f32;
-        for prob in probs.iter_mut() {
-            *prob = prob.max(MIN_PROB);
-            sum += *prob;
-        }
+        let (mut probs, sum) = self.model_weights();
         let inv = 1.0 / sum;
         for prob in probs.iter_mut() {
             *prob *= inv;
@@ -479,133 +497,168 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
     fn predict_cdf(&mut self) -> [u16; 257] {
         use crate::coding::rans::PROB_TOTAL;
 
-        // 1. Get RLE baseline prediction
-        let rle_probs = self.rle.predict();
-        self.last_rle_probs = rle_probs;
-
-        // 2. Extract RLE's binary decisions
-        let rle_p_run = rle_probs[0] + rle_probs[1];
-        let rle_p_runa = if rle_p_run > MIN_PROB {
-            rle_probs[0] / rle_p_run
-        } else {
-            0.5
-        };
-        self.last_rle_p_run = rle_p_run;
-        self.last_rle_p_runa = rle_p_runa;
-
-        // 3. Get SSM's binary predictions
-        let (ssm_p_run, ssm_p_runa) = self.ssm_binary_predict();
-        self.last_ssm_p_run = ssm_p_run;
-        self.last_ssm_p_runa = ssm_p_runa;
-
-        // 4. Mix binary decisions
-        let alpha = self.mixing_alpha();
-        let beta = 1.0 - alpha;
-        let p_run = alpha * ssm_p_run + beta * rle_p_run;
-        let p_runa = alpha * ssm_p_runa + beta * rle_p_runa;
-
-        // 5. Build CDF directly via cumulative rounding in f32.
-        // Same algorithm as probs_to_cdf's core loop but avoids:
-        // - f64 upcasting of all 256 probabilities
-        // - the expensive fixup path (sort + proportional redistribution)
-        // - materializing a separate [f32;256] intermediate for predict()
-        let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
-        let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-        let o2_obs = self.o2_lit_totals[o2_ctx];
-        let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
-        // Confidence-weighted blend (Stage B) — MUST match predict() exactly so
-        // the [f32;256] and direct-CDF paths agree.
-        let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
-
-        // First pass: compute raw probs and sum.
-        // Precompute reciprocals to replace 254+ divisions with multiplies.
-        let inv_rle_lit = 1.0 / rle_p_lit_total;
-        let inv_o2_total = 1.0 / o2_total;
-        let rle_weight = 1.0 - eff_blend;
-        let use_o2 = eff_blend > 0.0;
-
-        let mut raw = [0.0f32; 256];
-        raw[0] = (p_run * p_runa).max(MIN_PROB);
-        raw[1] = (p_run * (1.0 - p_runa)).max(MIN_PROB);
-        let p_lit = 1.0 - p_run;
-        let mut sum = raw[0] + raw[1];
-        for i in 2..256 {
-            let rle_p = rle_probs[i] * inv_rle_lit;
-            let lit_p = if use_o2 {
-                let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                rle_weight * rle_p + eff_blend * o2_p
-            } else {
-                rle_p
-            };
-            let p = (p_lit * lit_p).max(MIN_PROB);
-            raw[i] = p;
-            sum += p;
-        }
-
-        // Cumulative rounding: same precision as probs_to_cdf but in f32.
-        //
-        // ── Early-exit overshoot detection ────────────────────────────
-        //
-        // On real NeuralSSM data (BWT+MTF+RLE of English text), the
-        // overshoot fallback fires on ~98.76% of bytes — measured via
-        // the `query_cdf_overshoot_rate_on_bench_corpus` diagnostic.
-        // Each overshoot wastes both the f32 cumulative-rounding sweep
-        // AND the f32 monotonicity fix-up before calling `probs_to_cdf`.
-        //
-        // Observation: overshoot is GUARANTEED whenever the rounded gap
-        // `cur - prev` is zero anywhere in the interior. The fix-up loop
-        // would then bump `cdf[i+1] = cdf[i] + 1`, and any such bump
-        // pushes `cdf[256]` past `PROB_TOTAL` (since the rounded
-        // `cdf[256]` is anchored at `PROB_TOTAL` and bumps only ever
-        // increase). So we can break out of the rounding loop the
-        // instant we see `cur <= prev` and fall straight to
-        // `probs_to_cdf` — bit-identical to running the full f32 path
-        // and then hitting the same fallback.
-        //
-        // For peaked NeuralSSM distributions this typically triggers at
-        // i ≈ 3..10 (just past the RUNA/RUNB peak), so we skip ~250
-        // iterations of pass 2 + all 256 of pass 3 on every overshoot
-        // byte. The `predict_cdf_early_exit_microbench` test measures a
-        // **+19.08% speedup (1.24x)** on the BWT-encoded English corpus
-        // the `compress_ssm` criterion bench uses, with bit-identity to
-        // the reference verified by `predict_cdf_early_exit_matches_reference`.
-        let scale = PROB_TOTAL as f32 / sum;
-        let mut cdf = [0u16; 257];
-        let mut cum = 0.0f32;
-        let mut prev: u16 = 0;
+        let (weights, sum) = self.model_weights();
+        let mut monotone_cdf = [0u16; 257];
+        let mut cumulative = 0.0f64;
+        let total = sum as f64;
         for i in 0..256 {
-            let cur = (cum * scale + 0.5) as u16;
-            // i > 0 because cdf[0] = 0 by initialization and the first
-            // rounded value (i=0) is also 0 — the `<=` would trigger
-            // spuriously. From i=1 onward, `cur <= prev` means a zero
-            // rounded gap → fix-up will bump → overshoot guaranteed.
-            if i > 0 && cur <= prev {
+            monotone_cdf[i] = Self::quantized_boundary(cumulative, total, i);
+            cumulative += weights[i] as f64;
+        }
+        monotone_cdf[256] = PROB_TOTAL as u16;
+        return monotone_cdf;
+
+        // Retained as a compile-disabled reference for ratio/performance
+        // comparisons against the pre-0.3 quantizer.
+        #[cfg(any())]
+        {
+            // 1. Get RLE baseline prediction
+            let rle_probs = self.rle.predict();
+            self.last_rle_probs = rle_probs;
+
+            // 2. Extract RLE's binary decisions
+            let rle_p_run = rle_probs[0] + rle_probs[1];
+            let rle_p_runa = if rle_p_run > MIN_PROB {
+                rle_probs[0] / rle_p_run
+            } else {
+                0.5
+            };
+            self.last_rle_p_run = rle_p_run;
+            self.last_rle_p_runa = rle_p_runa;
+
+            // 3. Get SSM's binary predictions
+            let (ssm_p_run, ssm_p_runa) = self.ssm_binary_predict();
+            self.last_ssm_p_run = ssm_p_run;
+            self.last_ssm_p_runa = ssm_p_runa;
+
+            // 4. Mix binary decisions
+            let alpha = self.mixing_alpha();
+            let beta = 1.0 - alpha;
+            let p_run = alpha * ssm_p_run + beta * rle_p_run;
+            let p_runa = alpha * ssm_p_runa + beta * rle_p_runa;
+
+            // 5. Build CDF directly via cumulative rounding in f32.
+            // Same algorithm as probs_to_cdf's core loop but avoids:
+            // - f64 upcasting of all 256 probabilities
+            // - the expensive fixup path (sort + proportional redistribution)
+            // - materializing a separate [f32;256] intermediate for predict()
+            let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
+            let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
+            let o2_obs = self.o2_lit_totals[o2_ctx];
+            let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
+            // Confidence-weighted blend (Stage B) — MUST match predict() exactly so
+            // the [f32;256] and direct-CDF paths agree.
+            let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
+
+            // First pass: compute raw probs and sum.
+            // Precompute reciprocals to replace 254+ divisions with multiplies.
+            let inv_rle_lit = 1.0 / rle_p_lit_total;
+            let inv_o2_total = 1.0 / o2_total;
+            let rle_weight = 1.0 - eff_blend;
+            let use_o2 = eff_blend > 0.0;
+
+            let mut raw = [0.0f32; 256];
+            raw[0] = (p_run * p_runa).max(MIN_PROB);
+            raw[1] = (p_run * (1.0 - p_runa)).max(MIN_PROB);
+            let p_lit = 1.0 - p_run;
+            let mut sum = raw[0] + raw[1];
+            for i in 2..256 {
+                let rle_p = rle_probs[i] * inv_rle_lit;
+                let lit_p = if use_o2 {
+                    let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
+                    rle_weight * rle_p + eff_blend * o2_p
+                } else {
+                    rle_p
+                };
+                let p = (p_lit * lit_p).max(MIN_PROB);
+                raw[i] = p;
+                sum += p;
+            }
+
+            // Cumulative rounding: same precision as probs_to_cdf but in f32.
+            //
+            // ── Early-exit overshoot detection ────────────────────────────
+            //
+            // On real NeuralSSM data (BWT+MTF+RLE of English text), the
+            // overshoot fallback fires on ~98.76% of bytes — measured via
+            // the `query_cdf_overshoot_rate_on_bench_corpus` diagnostic.
+            // Each overshoot wastes both the f32 cumulative-rounding sweep
+            // AND the f32 monotonicity fix-up before calling `probs_to_cdf`.
+            //
+            // Observation: overshoot is GUARANTEED whenever the rounded gap
+            // `cur - prev` is zero anywhere in the interior. The fix-up loop
+            // would then bump `cdf[i+1] = cdf[i] + 1`, and any such bump
+            // pushes `cdf[256]` past `PROB_TOTAL` (since the rounded
+            // `cdf[256]` is anchored at `PROB_TOTAL` and bumps only ever
+            // increase). So we can break out of the rounding loop the
+            // instant we see `cur <= prev` and fall straight to
+            // `probs_to_cdf` — bit-identical to running the full f32 path
+            // and then hitting the same fallback.
+            //
+            // For peaked NeuralSSM distributions this typically triggers at
+            // i ≈ 3..10 (just past the RUNA/RUNB peak), so we skip ~250
+            // iterations of pass 2 + all 256 of pass 3 on every overshoot
+            // byte. The `predict_cdf_early_exit_microbench` test measures a
+            // **+19.08% speedup (1.24x)** on the BWT-encoded English corpus
+            // the `compress_ssm` criterion bench uses, with bit-identity to
+            // the reference verified by `predict_cdf_early_exit_matches_reference`.
+            let scale = PROB_TOTAL as f32 / sum;
+            let mut cdf = [0u16; 257];
+            let mut cum = 0.0f32;
+            let mut prev: u16 = 0;
+            for i in 0..256 {
+                let cur = (cum * scale + 0.5) as u16;
+                // i > 0 because cdf[0] = 0 by initialization and the first
+                // rounded value (i=0) is also 0 — the `<=` would trigger
+                // spuriously. From i=1 onward, `cur <= prev` means a zero
+                // rounded gap → fix-up will bump → overshoot guaranteed.
+                if i > 0 && cur <= prev {
+                    return crate::coding::rans::probs_to_cdf(&raw);
+                }
+                cdf[i] = cur;
+                prev = cur;
+                cum += raw[i];
+            }
+            cdf[256] = PROB_TOTAL as u16;
+
+            // Ensure strict monotonicity. With the early-exit above, all
+            // interior gaps are guaranteed >= 1, so the only entry the
+            // fix-up can touch is cdf[256] (when cdf[255] rounds up to
+            // PROB_TOTAL on a floating-point boundary). We still need this
+            // loop for that edge case, but it's a no-op for indices 0..255
+            // in the hot path.
+            for i in 0..256 {
+                if cdf[i + 1] <= cdf[i] {
+                    cdf[i + 1] = cdf[i] + 1;
+                }
+            }
+
+            // If forward fixup overshot, fall back to full probs_to_cdf.
+            if cdf[256] != PROB_TOTAL as u16 {
                 return crate::coding::rans::probs_to_cdf(&raw);
             }
-            cdf[i] = cur;
-            prev = cur;
-            cum += raw[i];
-        }
-        cdf[256] = PROB_TOTAL as u16;
 
-        // Ensure strict monotonicity. With the early-exit above, all
-        // interior gaps are guaranteed >= 1, so the only entry the
-        // fix-up can touch is cdf[256] (when cdf[255] rounds up to
-        // PROB_TOTAL on a floating-point boundary). We still need this
-        // loop for that edge case, but it's a no-op for indices 0..255
-        // in the hot path.
-        for i in 0..256 {
-            if cdf[i + 1] <= cdf[i] {
-                cdf[i + 1] = cdf[i] + 1;
-            }
+            cdf
         }
+    }
 
-        // If forward fixup overshot, fall back to full probs_to_cdf.
-        if cdf[256] != PROB_TOTAL as u16 {
-            return crate::coding::rans::probs_to_cdf(&raw);
+    /// Encode-only fast path that computes just the selected symbol interval.
+    #[inline]
+    fn query_cdf(&mut self, byte: u8) -> (u16, u16) {
+        let (weights, sum) = self.model_weights();
+        let symbol = byte as usize;
+        let mut cumulative = 0.0f64;
+        for &weight in &weights[..symbol] {
+            cumulative += weight as f64;
         }
-
-        cdf
+        let lo = Self::quantized_boundary(cumulative, sum as f64, symbol);
+        cumulative += weights[symbol] as f64;
+        let hi = if symbol == 255 {
+            crate::coding::rans::PROB_TOTAL as u16
+        } else {
+            Self::quantized_boundary(cumulative, sum as f64, symbol + 1)
+        };
+        (lo, hi)
     }
 
     #[inline]
@@ -969,6 +1022,7 @@ impl NeuralSsmPredictor {
     /// overshoot detection — used by the microbench and bit-identity
     /// tests to validate the production version above. Test-only; never
     /// called from compress/decompress paths.
+    #[allow(dead_code)]
     pub(crate) fn predict_cdf_no_early_exit(&mut self) -> [u16; 257] {
         use crate::coding::rans::PROB_TOTAL;
 
@@ -1055,13 +1109,19 @@ impl NeuralSsmPredictor {
 mod tests {
     use super::*;
 
-    /// Bit-identity guard: the early-exit `predict_cdf` must produce the
-    /// exact same CDF as the reference implementation at every step of a
-    /// real RLE-shaped byte stream. Catches regressions where the
-    /// early-exit predicate would diverge from the post-fix-up overshoot
-    /// check (e.g. boundary-rounding edge cases).
     #[test]
-    fn predict_cdf_early_exit_matches_reference() {
+    fn sigmoid_lookup_tracks_exact_curve() {
+        for step in -2000..=2000 {
+            let x = step as f32 / 100.0;
+            let exact = 1.0 / (1.0 + (-x).exp());
+            let error = (sigmoid(x) - exact).abs();
+            assert!(error < 0.000_001, "sigmoid LUT error {error} at x={x}");
+        }
+    }
+
+    /// Bit-identity guard for the encode-only query and decoder CDF paths.
+    #[test]
+    fn query_cdf_matches_decoder_cdf() {
         // Use the same bias as roundtrip_with_range_coder: heavy RUNA/RUNB
         // distribution that drives the overshoot path on essentially
         // every byte.
@@ -1077,17 +1137,19 @@ mod tests {
             data.push(b);
         }
 
-        let mut early = NeuralSsmPredictor::new();
-        let mut reference = NeuralSsmPredictor::new();
+        let mut query_predictor = NeuralSsmPredictor::new();
+        let mut cdf_predictor = NeuralSsmPredictor::new();
         for (step, &byte) in data.iter().enumerate() {
-            let cdf_early = early.predict_cdf();
-            let cdf_ref = reference.predict_cdf_no_early_exit();
+            let interval = query_predictor.query_cdf(byte);
+            let cdf = cdf_predictor.predict_cdf();
+            let symbol = byte as usize;
             assert_eq!(
-                cdf_early, cdf_ref,
-                "CDF diverged at step {step} (byte={byte})"
+                interval,
+                (cdf[symbol], cdf[symbol + 1]),
+                "CDF interval diverged at step {step} (byte={byte})"
             );
-            early.update(byte);
-            reference.update(byte);
+            query_predictor.update(byte);
+            cdf_predictor.update(byte);
         }
     }
 
@@ -1098,7 +1160,7 @@ mod tests {
     #[test]
     #[ignore]
     #[cfg(feature = "bwt-encode")]
-    fn predict_cdf_early_exit_microbench() {
+    fn query_cdf_microbench() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1124,8 +1186,10 @@ mod tests {
         let mut sample_ref = 0u64;
         let start = std::time::Instant::now();
         for &byte in &bwt_data {
-            let cdf = pred_ref.predict_cdf_no_early_exit();
-            sample_ref = sample_ref.wrapping_add(cdf[byte as usize] as u64);
+            let cdf = pred_ref.predict_cdf();
+            sample_ref = sample_ref
+                .wrapping_add(cdf[byte as usize] as u64)
+                .wrapping_add(cdf[byte as usize + 1] as u64);
             pred_ref.update(byte);
         }
         let ref_time = start.elapsed();
@@ -1134,24 +1198,21 @@ mod tests {
         let mut sample_opt = 0u64;
         let start = std::time::Instant::now();
         for &byte in &bwt_data {
-            let cdf = pred_opt.predict_cdf();
-            sample_opt = sample_opt.wrapping_add(cdf[byte as usize] as u64);
+            let (lo, hi) = pred_opt.query_cdf(byte);
+            sample_opt = sample_opt.wrapping_add(lo as u64).wrapping_add(hi as u64);
             pred_opt.update(byte);
         }
         let opt_time = start.elapsed();
 
         // The samples should match — bit-identity proven again.
-        assert_eq!(
-            sample_ref, sample_opt,
-            "predict_cdf diverged from reference"
-        );
+        assert_eq!(sample_ref, sample_opt, "query_cdf diverged from full CDF");
 
         let ref_mbps = bwt_data.len() as f64 / ref_time.as_secs_f64() / (1024.0 * 1024.0);
         let opt_mbps = bwt_data.len() as f64 / opt_time.as_secs_f64() / (1024.0 * 1024.0);
         let delta = (1.0 - opt_time.as_secs_f64() / ref_time.as_secs_f64()) * 100.0;
         let speedup = ref_time.as_secs_f64() / opt_time.as_secs_f64();
-        eprintln!("[reference   ] {:?}  ({:.3} MiB/s)", ref_time, ref_mbps);
-        eprintln!("[early-exit  ] {:?}  ({:.3} MiB/s)", opt_time, opt_mbps);
+        eprintln!("[full CDF    ] {:?}  ({:.3} MiB/s)", ref_time, ref_mbps);
+        eprintln!("[query CDF   ] {:?}  ({:.3} MiB/s)", opt_time, opt_mbps);
         eprintln!(
             "[delta] early-exit is {:+.2}% faster (speedup {:.3}x)",
             delta, speedup
