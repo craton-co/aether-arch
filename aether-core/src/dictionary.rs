@@ -94,21 +94,20 @@ impl Dictionary {
     ) -> Result<Self> {
         use crate::chunker;
         use crate::coding::bwt_preprocess;
-        // Matches router::compress_chunk's BWT_ENTROPY_SKIP.
-        const BWT_ENTROPY_SKIP: f64 = 6.5;
+        use crate::format::BWT_ENTROPY_SKIP;
         for path in training_files {
             let data = std::fs::read(path.as_ref())?;
             let chunks = if data.len() < chunker::MIN_CHUNK_SIZE as usize {
-                chunker::chunk_fixed(&data, chunker::AVG_CHUNK_SIZE as usize)
+                chunker::chunk_fixed_refs(&data, chunker::AVG_CHUNK_SIZE as usize)
             } else {
-                chunker::chunk_data(&data)
+                chunker::chunk_data_refs(&data)
             };
             for chunk in &chunks {
                 if chunk.data.len() < 8 || chunk.entropy >= BWT_ENTROPY_SKIP {
                     continue;
                 }
                 let Ok((_primary_index, mtf_data)) =
-                    bwt_preprocess::bwt_mtf_encode_parts(&chunk.data)
+                    bwt_preprocess::bwt_mtf_encode_parts(chunk.data)
                 else {
                     continue;
                 };
