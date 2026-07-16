@@ -16,6 +16,7 @@ fn arb_compression_method() -> impl Strategy<Value = CompressionMethod> {
         Just(CompressionMethod::Lz77PredictorRans),
         Just(CompressionMethod::BwtPredictorRans),
         Just(CompressionMethod::BytePlanePredictorRans),
+        Just(CompressionMethod::BcjZstd),
     ]
 }
 
@@ -117,8 +118,8 @@ proptest! {
     #[test]
     fn compression_method_from_u8_never_panics(v in any::<u8>()) {
         let result = CompressionMethod::from_u8(v);
-        // Valid values 0..=6 should return Ok, everything else Err
-        if v <= 6 {
+        // Valid values 0..=7 should return Ok, everything else Err
+        if v <= 7 {
             prop_assert!(result.is_ok());
         } else {
             prop_assert!(result.is_err());
