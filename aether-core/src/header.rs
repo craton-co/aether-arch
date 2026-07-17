@@ -62,7 +62,7 @@ impl ArchiveHeader {
         // Read magic
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
-        if magic != MAGIC {
+        if magic != MAGIC && magic != LEGACY_MAGIC {
             return Err(AetherError::InvalidMagic);
         }
 
@@ -192,6 +192,24 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    fn shared_prefix_len(&self, previous_path: &str) -> usize {
+        let path_bytes = self.path.as_bytes();
+        let mut prefix_len = path_bytes
+            .iter()
+            .zip(previous_path.as_bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        while prefix_len > 0 && !self.path.is_char_boundary(prefix_len) {
+            prefix_len -= 1;
+        }
+        prefix_len
+    }
+
+    /// Bytes used by the prefix-compressed path portion of this entry.
+    pub fn prefixed_path_size(&self, previous_path: &str) -> usize {
+        4 + self.path.len() - self.shared_prefix_len(previous_path)
+    }
+
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         let path_bytes = self.path.as_bytes();
         w.write_u16::<LittleEndian>(path_bytes.len() as u16)?;
@@ -267,6 +285,61 @@ impl FileEntry {
             permissions,
             mtime,
         })
+    }
+
+    /// Serialize using the longest UTF-8-safe byte prefix shared with the
+    /// previous file-table path.
+    pub fn write_prefixed<W: Write>(&self, w: &mut W, previous_path: &str) -> Result<()> {
+        let path_bytes = self.path.as_bytes();
+        let prefix_len = self.shared_prefix_len(previous_path);
+        let suffix = &path_bytes[prefix_len..];
+        w.write_u16::<LittleEndian>(
+            u16::try_from(prefix_len).map_err(|_| {
+                AetherError::ResourceLimitExceeded("Path prefix exceeds u16".into())
+            })?,
+        )?;
+        w.write_u16::<LittleEndian>(
+            u16::try_from(suffix.len()).map_err(|_| {
+                AetherError::ResourceLimitExceeded("Path suffix exceeds u16".into())
+            })?,
+        )?;
+        w.write_all(suffix)?;
+        w.write_u64::<LittleEndian>(self.original_size)?;
+        w.write_all(&self.blake3_hash)?;
+        w.write_u32::<LittleEndian>(self.solid_group_id)?;
+        w.write_u32::<LittleEndian>(self.chunk_start_idx)?;
+        w.write_u32::<LittleEndian>(self.chunk_count)?;
+        w.write_u32::<LittleEndian>(self.permissions)?;
+        w.write_i64::<LittleEndian>(self.mtime)?;
+        Ok(())
+    }
+
+    /// Deserialize a prefix-compressed file-table entry.
+    pub fn read_prefixed<R: Read>(r: &mut R, previous_path: &str) -> Result<Self> {
+        let prefix_len = r.read_u16::<LittleEndian>()? as usize;
+        let suffix_len = r.read_u16::<LittleEndian>()? as usize;
+        if prefix_len > previous_path.len()
+            || !previous_path.is_char_boundary(prefix_len)
+            || prefix_len.saturating_add(suffix_len) > MAX_PATH_LENGTH
+        {
+            return Err(AetherError::ResourceLimitExceeded(format!(
+                "Invalid compressed path lengths: prefix={prefix_len}, suffix={suffix_len}"
+            )));
+        }
+
+        let mut path = previous_path.as_bytes()[..prefix_len].to_vec();
+        path.resize(prefix_len + suffix_len, 0);
+        r.read_exact(&mut path[prefix_len..])?;
+
+        // Reuse the canonical parser and all of its path/security checks.
+        const FIXED_FIELDS_SIZE: usize = 64;
+        let mut fixed_fields = [0u8; FIXED_FIELDS_SIZE];
+        r.read_exact(&mut fixed_fields)?;
+        let mut canonical = Vec::with_capacity(2 + path.len() + FIXED_FIELDS_SIZE);
+        canonical.write_u16::<LittleEndian>(path.len() as u16)?;
+        canonical.extend_from_slice(&path);
+        canonical.extend_from_slice(&fixed_fields);
+        Self::read_from(&mut std::io::Cursor::new(canonical))
     }
 }
 
@@ -487,6 +560,25 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         let decoded = FileEntry::read_from(&mut cursor).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn file_entry_prefix_roundtrip() {
+        let entry = FileEntry {
+            path: "src/components/renderer.rs".into(),
+            original_size: 42,
+            blake3_hash: [7; 32],
+            solid_group_id: 2,
+            chunk_start_idx: 3,
+            chunk_count: 1,
+            permissions: 0o644,
+            mtime: 1_700_000_000,
+        };
+        let previous = "src/components/parser.rs";
+        let mut buffer = Vec::new();
+        entry.write_prefixed(&mut buffer, previous).unwrap();
+        let decoded = FileEntry::read_prefixed(&mut Cursor::new(buffer), previous).unwrap();
         assert_eq!(entry, decoded);
     }
 
