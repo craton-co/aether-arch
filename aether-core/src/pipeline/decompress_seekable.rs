@@ -230,8 +230,15 @@ impl Decompressor {
         archive.seek(SeekFrom::Start(footer.file_table_offset))?;
         let mut file_entries =
             Vec::with_capacity((footer.file_count as usize).min(MAX_PREALLOC_CAPACITY));
+        let mut previous_path = String::new();
         for _ in 0..footer.file_count {
-            file_entries.push(FileEntry::read_from(archive)?);
+            let entry = if header.flags & FLAG_PATH_PREFIXES != 0 {
+                FileEntry::read_prefixed(archive, &previous_path)?
+            } else {
+                FileEntry::read_from(archive)?
+            };
+            previous_path.clone_from(&entry.path);
+            file_entries.push(entry);
         }
 
         // Read solid group table (immediately after file table)
