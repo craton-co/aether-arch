@@ -29,6 +29,18 @@ struct CompressedFileBlocks {
     blocks: Vec<router::CompressedChunk>,
 }
 
+/// Compression policy applied independently to each semantic solid group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionProfile {
+    /// Ratio-first routing: evaluate neural/BWT paths and all safe fallbacks.
+    #[default]
+    Archival,
+    /// Archival routing for text/numeric groups and fast routing for binaries.
+    Balanced,
+    /// Prefer BCJ/Zstandard or Store for every group.
+    Fast,
+}
+
 /// Compresses files into an AetherArch archive.
 ///
 /// # Memory Backpressure
@@ -62,6 +74,8 @@ pub struct Compressor {
     /// Maximum number of concurrent compression threads.
     /// 0 means use all available cores (rayon default).
     max_threads: usize,
+    /// Per-group ratio/speed routing policy.
+    profile: CompressionProfile,
     /// Encryption configuration (enterprise feature).
     #[cfg(feature = "enterprise")]
     encryption_config: Option<EncryptionConfig>,
@@ -117,6 +131,7 @@ impl Compressor {
             predictor_factory: Box::new(factory),
             predictor_id: pid,
             max_threads: default_max_threads(),
+            profile: CompressionProfile::Archival,
             #[cfg(feature = "enterprise")]
             encryption_config: None,
             dictionary: None,
@@ -149,6 +164,17 @@ impl Compressor {
     /// for use when the `Compressor` is already constructed (e.g. behind an FFI handle).
     pub fn set_max_threads(&mut self, max_threads: usize) {
         self.max_threads = max_threads;
+    }
+
+    /// Select the ratio/speed routing policy.
+    pub fn with_profile(mut self, profile: CompressionProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Select the ratio/speed routing policy on an existing compressor.
+    pub fn set_profile(&mut self, profile: CompressionProfile) {
+        self.profile = profile;
     }
 
     /// Enable encryption for the output archive (enterprise feature).
@@ -263,7 +289,22 @@ impl Compressor {
         }
 
         // ── Step 3: Write placeholder header ─────────────────────────────
+        let raw_path_bytes: usize = file_entries.iter().map(|entry| 2 + entry.path.len()).sum();
+        let mut previous_path = "";
+        let prefixed_path_bytes: usize = file_entries
+            .iter()
+            .map(|entry| {
+                let size = entry.prefixed_path_size(previous_path);
+                previous_path = &entry.path;
+                size
+            })
+            .sum();
+        let use_path_prefixes = prefixed_path_bytes < raw_path_bytes;
+
         let mut flags = FLAG_SOLID_ARCHIVE;
+        if use_path_prefixes {
+            flags |= FLAG_PATH_PREFIXES;
+        }
 
         if self.dictionary.is_some() {
             flags |= FLAG_HAS_DICTIONARY;
@@ -340,8 +381,14 @@ impl Compressor {
 
         // We'll need to patch chunk_start_idx and chunk_count later
         let file_table_pos = file_table_offset;
+        let mut previous_path = "";
         for entry in &file_entries {
-            entry.write_to(output)?;
+            if use_path_prefixes {
+                entry.write_prefixed(output, previous_path)?;
+            } else {
+                entry.write_to(output)?;
+            }
+            previous_path = &entry.path;
         }
 
         // ── Step 5: Write solid group table ──────────────────────────────
@@ -394,9 +441,11 @@ impl Compressor {
             |group: &crate::grouper::SolidGroup| -> Result<Vec<CompressedFileBlocks>> {
                 // One predictor per group — created inside the closure so each
                 // rayon worker thread gets its own instance (no sharing).
+                #[cfg(not(feature = "threading"))]
                 let mut predictor = (self.predictor_factory)();
                 // Apply dictionary state if configured — propagate failure to
                 // prevent silently compressing with wrong predictor state.
+                #[cfg(not(feature = "threading"))]
                 if let Some(ref dict) = self.dictionary {
                     dict.apply(predictor.as_mut()).map_err(|e| {
                         AetherError::Compression(format!(
@@ -415,20 +464,47 @@ impl Compressor {
                     let file_data = &file_datas[file_idx];
 
                     let chunks = if file_data.len() < chunker::MIN_CHUNK_SIZE as usize {
-                        chunker::chunk_fixed(file_data, chunker::AVG_CHUNK_SIZE as usize)
+                        chunker::chunk_fixed_refs(file_data, chunker::AVG_CHUNK_SIZE as usize)
                     } else {
-                        chunker::chunk_data(file_data)
+                        chunker::chunk_data_refs(file_data)
                     };
                     let chunk_count = chunks.len();
 
-                    let mut blocks = Vec::with_capacity(chunk_count);
-                    for chunk in &chunks {
-                        blocks.push(router::compress_chunk(
-                            chunk,
-                            predictor.as_mut(),
-                            group.content_type,
-                        )?);
-                    }
+                    #[cfg(feature = "threading")]
+                    let blocks = chunks
+                        .par_iter()
+                        .map(|chunk| {
+                            let mut predictor = (self.predictor_factory)();
+                            if let Some(ref dict) = self.dictionary {
+                                dict.apply(predictor.as_mut()).map_err(|error| {
+                                    AetherError::Compression(format!(
+                                        "Failed to apply dictionary to predictor: {error}"
+                                    ))
+                                })?;
+                                predictor.set_coding_baseline(&dict.state);
+                            }
+                            router::compress_chunk(
+                                chunk,
+                                predictor.as_mut(),
+                                group.content_type,
+                                self.profile,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    #[cfg(not(feature = "threading"))]
+                    let blocks = {
+                        let mut blocks = Vec::with_capacity(chunk_count);
+                        for chunk in &chunks {
+                            blocks.push(router::compress_chunk(
+                                chunk,
+                                predictor.as_mut(),
+                                group.content_type,
+                                self.profile,
+                            )?);
+                        }
+                        blocks
+                    };
 
                     results.push(CompressedFileBlocks {
                         file_idx,
@@ -644,8 +720,14 @@ impl Compressor {
         output
             .seek(SeekFrom::Start(file_table_pos))
             .map_err(AetherError::Io)?;
+        let mut previous_path = "";
         for entry in &file_entries {
-            entry.write_to(output)?;
+            if use_path_prefixes {
+                entry.write_prefixed(output, previous_path)?;
+            } else {
+                entry.write_to(output)?;
+            }
+            previous_path = &entry.path;
         }
 
         // Re-write solid group table with correct block indices
