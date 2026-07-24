@@ -13,7 +13,7 @@ use aether_core::entropy::{
 };
 use aether_core::format::PredictorId;
 use aether_core::header::ArchiveHeader;
-use aether_core::pipeline::compress::Compressor;
+use aether_core::pipeline::compress::{CompressionProfile, Compressor};
 use aether_core::pipeline::decompress::Decompressor;
 
 #[derive(Parser)]
@@ -43,6 +43,10 @@ enum Commands {
         /// Predictor: order0, cm (context-mixer, default)
         #[arg(short, long, default_value = "cm")]
         predictor: String,
+
+        /// Compression profile: archival (ratio), balanced, or fast
+        #[arg(long, default_value = "archival")]
+        profile: String,
 
         /// Encrypt the archive with a password (requires enterprise feature).
         /// Use --password without a value to be prompted securely.
@@ -702,6 +706,7 @@ fn main() -> Result<()> {
             inputs,
             output,
             predictor,
+            profile,
             mut password,
             cipher,
             analytics: show_analytics,
@@ -709,6 +714,14 @@ fn main() -> Result<()> {
             auto_dict,
             force,
         } => {
+            let compression_profile = match profile.as_str() {
+                "archival" => CompressionProfile::Archival,
+                "balanced" => CompressionProfile::Balanced,
+                "fast" => CompressionProfile::Fast,
+                other => anyhow::bail!(
+                    "Unknown compression profile '{other}'. Use: archival, balanced, fast"
+                ),
+            };
             // S10: warn if --cipher was explicitly set without enterprise feature
             #[cfg(not(feature = "enterprise"))]
             if cipher != "aes" {
@@ -758,17 +771,16 @@ fn main() -> Result<()> {
                     let f1 = make_predictor_factory("ssm")?;
                     let mut cur_with = Cursor::new(Vec::new());
                     let (stats, _) = Compressor::new(move || f1())
+                        .with_profile(compression_profile)
                         .with_dictionary(bdict)
                         .compress_to_archive(&base_dir, &files, &mut cur_with)?;
                     let buf_with = cur_with.into_inner();
                     // Pass 2: without any dictionary.
                     let f2 = make_predictor_factory("ssm")?;
                     let mut cur_without = Cursor::new(Vec::new());
-                    Compressor::new(move || f2()).compress_to_archive(
-                        &base_dir,
-                        &files,
-                        &mut cur_without,
-                    )?;
+                    Compressor::new(move || f2())
+                        .with_profile(compression_profile)
+                        .compress_to_archive(&base_dir, &files, &mut cur_without)?;
                     let buf_without = cur_without.into_inner();
 
                     let used = buf_with.len() < buf_without.len();
@@ -807,7 +819,8 @@ fn main() -> Result<()> {
             }
 
             let factory = make_predictor_factory(&predictor)?;
-            let mut compressor = Compressor::new(move || factory());
+            let mut compressor =
+                Compressor::new(move || factory()).with_profile(compression_profile);
 
             if let Some(ref dict_path) = dictionary {
                 let dict = aether_core::dictionary::Dictionary::load(dict_path)
@@ -843,7 +856,7 @@ fn main() -> Result<()> {
             }
 
             eprintln!(
-                "Compressing {} file(s) with {} predictor...",
+                "Compressing {} file(s) with {} predictor ({profile} profile)...",
                 files.len(),
                 predictor
             );
