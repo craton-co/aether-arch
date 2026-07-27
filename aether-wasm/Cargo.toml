@@ -1,6 +1,6 @@
 [package]
 name = "aether-wasm"
-version = "0.2.3"
+version = "0.3.0"
 edition.workspace = true
 description = "WebAssembly bindings for AetherArch decompression"
 license.workspace = true
