@@ -2,6 +2,25 @@
 
 Performance measurements and tuning workflows for the `aet` archiver.
 
+## Workload Matrix
+
+Use the checked-in matrix runner for repeatable text, log, executable/binary,
+image, and tiny-file measurements across all compression profiles:
+
+```powershell
+pwsh ./scripts/benchmark-matrix.ps1 `
+  -Binary C:\path\to\aet-aether-opt-019fb2fb.exe `
+  -DatasetRoot C:\datasets\aether `
+  -Iterations 10 `
+  -OutputCsv benchmark-matrix.csv
+```
+
+The dataset root contains `text`, `logs`, `binaries`, `images`, and `tiny`
+directories. The runner records input/archive bytes, ratio, compression and
+extraction time, and throughput for `archival`, `balanced`, and `fast`.
+Missing workload directories are reported and skipped. Keep published results
+separate from historical values in `docs/BENCHMARKS.md`.
+
 ## Profile-Guided Optimization
 
 AetherArch's hot path is byte-level entropy coding: millions of small

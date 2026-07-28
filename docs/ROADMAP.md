@@ -1,6 +1,20 @@
 # AetherArch Roadmap
 
-Production readiness, licensing, and monetization plan for AetherArch 0.2.3+.
+Production readiness, licensing, and monetization plan for AetherArch 0.3.0+.
+
+## Phase 7: Research proposal retirement (0.3.0) — COMPLETE
+
+- [x] Centralized the 7.0 bps BWT entropy threshold.
+- [x] Removed compressor-side chunk payload cloning with borrowed chunk views.
+- [x] Added NeuralSSM per-symbol CDF queries and monotone quantization.
+- [x] Added range-decoder prefix acceleration and a sigmoid lookup hot path.
+- [x] Added reversible x86/x86-64 BCJ plus ratio-safe routing.
+- [x] Added prefix-compressed file-table paths for tiny-file trees.
+- [x] Added archival, balanced, and fast per-group routing profiles.
+- [x] Added deterministic intra-group chunk parallelism under `threading`.
+- [x] Added the text/log/binary/image/tiny-file benchmark matrix runner.
+- [x] Kept ANS/FSE off the adaptive NeuralSSM stream; balanced mode uses
+  Zstandard's finite-state entropy implementation for suitable groups.
 
 ## Phase 1: Foundation (Weeks 1-4) — COMPLETE
 
@@ -63,7 +77,7 @@ Hardening for external use and first public release.
   - `decompress_block` errors now include block ID, archive offset, group ID, and method
   - `decompress_block_streaming` errors include block ID, group ID, and method
   - BWT/LZ77/LZ4 payload errors include sizes for corruption diagnosis
-- [x] Pin `lz4_flex = "=0.11.3"` and add format compatibility guard
+- [x] Pin `lz4_flex = "=0.11.6"` and add format compatibility guard
   - `lz4_flex`'s `compress_prepend_size` format is not part of the LZ4 frame spec
   - Version upgrade could cause silent decode failures on existing archives
   - Added warning in `lz_preprocess.rs` module docs

@@ -8,7 +8,9 @@ AetherArch uses a three-level compression strategy:
 2. **Predictor** - A probabilistic model that predicts the next byte of the preprocessed stream. The predictor produces a probability distribution over all 256 byte values.
 3. **Entropy coder** - A custom byte-aligned range coder (15-bit CDF precision) that encodes the actual byte using the predicted distribution. Better predictions = smaller output.
 
-The **adaptive router** inspects each chunk's Shannon entropy and selects the best compression cascade per-block: LZ4+Predictor+RC, plain Predictor+RC, Zstd, or Store.
+The **adaptive router** inspects each chunk's entropy, content type, and
+compression profile, then selects among BWT/LZ/predictor paths, numeric
+byte-plane coding, x86 BCJ+Zstandard, Zstandard, or Store.
 
 ---
 
@@ -221,6 +223,13 @@ Used when chunk entropy is between 7.5 and 7.95 bits/byte, or when all predictor
 ### `Store` - Raw Storage
 
 Used when chunk entropy exceeds 7.95 bits/byte (incompressible data). Applied to already-compressed data (JPEG, PNG, ZIP, encrypted data).
+
+### `BcjZstd` - x86/x86-64 BCJ + Zstandard
+
+ELF, PE, and Mach-O executables for x86 architectures can normalize relative
+CALL/JMP operands before Zstandard. The reversible candidate is retained only
+when smaller than the other route, so executable filtering cannot regress
+archive size. Balanced and fast profiles prioritize this path.
 
 ---
 

@@ -1,7 +1,7 @@
 # AetherArch - Claude Code Configuration
 
 **Project**: AetherArch (.aet) — next-generation file archiver in Rust  
-**Version**: V2.6  
+**Version**: 0.3.0
 **Status**: 285 tests (128 unit + 87 integration + 28 FFI + 41 server + 1 doc, 5 ignored)  
 **Workspace**: `aether-core`, `aether-cli` (`aet`), `aether-ffi`, `aether-server`, `aether-wasm`
 
@@ -179,7 +179,7 @@ publish = true
 ### Performance Checklist
 
 - **N+1 Issues**: Group predictor state reused within group (not recreated per block)
-- **Unbounded Operations**: FastCDC window bounded (512 KiB avg, 4 MiB max)
+- **Unbounded Operations**: FastCDC window bounded (512 KiB avg, 8 MiB max)
 - **Memory Leaks**: Rayon thread pool properly bounded; no stale predictors
 - **Caching**: Dictionary state precomputed once (not per-file)
 - **Hot Paths**: NeuralSsmPredictor.predict() and RangeEncoder inline-enabled
@@ -213,7 +213,7 @@ Ensure PR updates docs if it changes:
 ### [GOTCHA] BWT Memory Amplification
 - **Issue**: BWT on large inputs allocates 10× memory (SA construction)
 - **Solution**: MAX_BWT_INPUT_SIZE = 8 MiB enforced; larger chunks skip BWT
-- **Entropy-based skip**: Chunks >6.5 bps (very random) bypass SA-IS
+- **Entropy-based skip**: Chunks >=7.0 bps (very random) bypass SA-IS
 
 ### [GOTCHA] Predictor State Drift
 - **Issue**: Streaming path must carry predictor HashMap across blocks
@@ -231,7 +231,7 @@ Ensure PR updates docs if it changes:
 - **Test**: See `fuzz/decode_block` target
 
 ### [GOTCHA] lz4_flex Versioning
-- **Pinned**: "=0.11.3" for format stability (later versions may break decompression)
+- **Pinned**: "=0.11.6" for format stability (upgrades require compatibility testing)
 - **Why**: LZ4 format compatibility is subtle; unpin only with extensive testing
 
 ### [GOTCHA] Rayon Thread Pool Scope
