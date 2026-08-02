@@ -12,16 +12,18 @@
 //! we can try multiple transforms and pick the smallest result.
 
 use crate::analyzer::{self, RecommendedMethod};
-use crate::chunker::Chunk;
+use crate::chunker::ChunkRef;
 use crate::coding::byteplane_preprocess;
 #[cfg(feature = "lz4")]
 use crate::coding::lz_preprocess;
-use crate::coding::{bwt_preprocess, lz77_preprocess, rans, zstd_fallback};
+use crate::coding::{bcj, bwt_preprocess, lz77_preprocess, rans, zstd_fallback};
 use crate::entropy::{NeuralSsmPredictor, ProbabilityPredictor};
 use crate::error::{AetherError, Result};
 use crate::format::{
-    CompressionMethod, ContentType, BWT_DECISIVE_RATIO, MAX_DECOMPRESSED_BLOCK_SIZE,
+    CompressionMethod, ContentType, BWT_DECISIVE_RATIO, BWT_ENTROPY_SKIP,
+    MAX_DECOMPRESSED_BLOCK_SIZE,
 };
+use crate::pipeline::compress::CompressionProfile;
 
 /// Result of compressing a single chunk via the adaptive routing cascade.
 ///
@@ -48,11 +50,56 @@ pub struct CompressedChunk {
 /// Since `encode_block` calls `predictor.reset()` at the start,
 /// each attempt starts with clean predictor state.
 pub fn compress_chunk(
-    chunk: &Chunk,
+    chunk: &ChunkRef<'_>,
     predictor: &mut dyn ProbabilityPredictor,
     content_type: crate::format::ContentType,
+    profile: CompressionProfile,
 ) -> Result<CompressedChunk> {
+    let fast_route = profile == CompressionProfile::Fast
+        || (profile == CompressionProfile::Balanced
+            && matches!(
+                content_type,
+                ContentType::BinaryStructured
+                    | ContentType::BinaryRandom
+                    | ContentType::Image
+                    | ContentType::Executable
+            ));
+
+    if fast_route {
+        let zstd = zstd_fallback::compress(chunk.data)?;
+        let mut best = if zstd.len() < chunk.data.len() {
+            (CompressionMethod::Zstd, zstd)
+        } else {
+            (CompressionMethod::Store, chunk.data.to_vec())
+        };
+        if content_type == ContentType::Executable {
+            if let Some(transformed) = bcj::encode_x86(chunk.data) {
+                let compressed = zstd_fallback::compress(&transformed)?;
+                if compressed.len() < best.1.len() {
+                    best = (CompressionMethod::BcjZstd, compressed);
+                }
+            }
+        }
+        return Ok(CompressedChunk {
+            method: best.0,
+            data: best.1,
+            original_size: chunk.length,
+            blake3_hash: chunk.blake3_hash,
+            predictor_synced: false,
+        });
+    }
+
     let method = analyzer::recommend_method_for(chunk.entropy, content_type);
+    let bcj_candidate = if content_type == ContentType::Executable {
+        bcj::encode_x86(chunk.data).and_then(|transformed| {
+            zstd_fallback::compress(&transformed)
+                .ok()
+                .filter(|compressed| compressed.len() < chunk.data.len())
+                .map(|compressed| (CompressionMethod::BcjZstd, compressed))
+        })
+    } else {
+        None
+    };
 
     let mut predictor_synced = true;
 
@@ -79,9 +126,8 @@ pub fn compress_chunk(
             // still try byte-plane as a competing method after BWT/LZ77.
             let is_numeric = content_type == ContentType::NumericData;
             if is_numeric {
-                if let Some(width) = byteplane_preprocess::detect_numeric_width(&chunk.data) {
-                    if let Some(payload) =
-                        byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                if let Some(width) = byteplane_preprocess::detect_numeric_width(chunk.data) {
+                    if let Some(payload) = byteplane_preprocess::byteplane_encode(chunk.data, width)
                     {
                         if payload.len() < chunk.data.len() {
                             best = Some((CompressionMethod::BytePlanePredictorRans, payload));
@@ -93,9 +139,9 @@ pub fn compress_chunk(
                         byteplane_preprocess::BytePlaneWidth::Two,
                         byteplane_preprocess::BytePlaneWidth::Four,
                     ] {
-                        if byteplane_preprocess::is_byteplane_beneficial(&chunk.data, width) {
+                        if byteplane_preprocess::is_byteplane_beneficial(chunk.data, width) {
                             if let Some(payload) =
-                                byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                                byteplane_preprocess::byteplane_encode(chunk.data, width)
                             {
                                 let is_better =
                                     best.as_ref().is_none_or(|(_, b)| payload.len() < b.len());
@@ -119,14 +165,11 @@ pub fn compress_chunk(
             // Skip BWT for high-entropy chunks — suffix array construction
             // is expensive and BWT clustering provides minimal benefit on
             // near-random data.  Text is typically 4-5 bps.
-            // 6.5 bps: skip BWT for chunks unlikely to benefit from
-            // context clustering.  Data in the 6.5-7.0 range is rarely
-            // structured enough for BWT to beat LZ77/plain RC, and skipping
-            // the expensive SA construction yields a significant speed gain.
-            const BWT_ENTROPY_SKIP: f64 = 6.5;
+            // The shared threshold is also used by transformed dictionary
+            // training so the two paths cannot silently diverge.
             if chunk.data.len() >= 8 && chunk.entropy < BWT_ENTROPY_SKIP {
                 if let Ok((primary_index, mtf_data)) =
-                    bwt_preprocess::bwt_mtf_encode_parts(&chunk.data)
+                    bwt_preprocess::bwt_mtf_encode_parts(chunk.data)
                 {
                     // Try RLE first (much more compact); fall back to raw MTF
                     let (encode_data, rle_applied) =
@@ -162,7 +205,7 @@ pub fn compress_chunk(
                 !chunk.data.is_empty() && b.len() < chunk.data.len() / 100 * BWT_DECISIVE_RATIO
             });
             if !bwt_decisive {
-                if let Some(lz_bytes) = lz77_preprocess::lz77_encode(&chunk.data) {
+                if let Some(lz_bytes) = lz77_preprocess::lz77_encode(chunk.data) {
                     // Reuse scratch predictor (encode_block resets it first).
                     if let Ok(rc_bytes) = rans::encode_block(&lz_bytes, &mut scratch) {
                         let lz_len = lz_bytes.len() as u32;
@@ -187,9 +230,8 @@ pub fn compress_chunk(
             // competing method. Executables and structured binary can
             // contain embedded float tables that benefit from splitting.
             if !is_numeric && content_type != ContentType::Text {
-                if let Some(width) = byteplane_preprocess::detect_numeric_width(&chunk.data) {
-                    if let Some(payload) =
-                        byteplane_preprocess::byteplane_encode(&chunk.data, width)
+                if let Some(width) = byteplane_preprocess::detect_numeric_width(chunk.data) {
+                    if let Some(payload) = byteplane_preprocess::byteplane_encode(chunk.data, width)
                     {
                         let is_better = best.as_ref().is_none_or(|(_, b)| payload.len() < b.len());
                         if payload.len() < chunk.data.len() && is_better {
@@ -202,7 +244,7 @@ pub fn compress_chunk(
             // ── Try plain predictor + range coding ───────────────────
             // Reuse scratch predictor (encode_block resets it first).
             if best.is_none() {
-                if let Ok(rc_bytes) = rans::encode_block(&chunk.data, &mut scratch) {
+                if let Ok(rc_bytes) = rans::encode_block(chunk.data, &mut scratch) {
                     if rc_bytes.len() < chunk.data.len() {
                         best = Some((CompressionMethod::PredictorRans, rc_bytes));
                     }
@@ -246,30 +288,41 @@ pub fn compress_chunk(
                         // through the predictor to maintain cross-block state.
                         // This matches the decompressor path which also calls
                         // sync_predictor on the decompressed original data.
-                        sync_predictor(predictor, &chunk.data);
+                        sync_predictor(predictor, chunk.data);
                     }
                     _ => {}
                 }
                 (method, payload)
             } else {
                 // Nothing helped — fall back to zstd/store
-                sync_predictor(predictor, &chunk.data);
+                sync_predictor(predictor, chunk.data);
                 try_zstd_or_store(chunk)
             }
         }
         RecommendedMethod::Zstd => {
-            let compressed = zstd_fallback::compress(&chunk.data)?;
-            sync_predictor(predictor, &chunk.data);
+            let compressed = zstd_fallback::compress(chunk.data)?;
+            sync_predictor(predictor, chunk.data);
             if compressed.len() >= chunk.data.len() {
-                (CompressionMethod::Store, chunk.data.clone())
+                (CompressionMethod::Store, chunk.data.to_vec())
             } else {
                 (CompressionMethod::Zstd, compressed)
             }
         }
         RecommendedMethod::Store => {
-            sync_predictor(predictor, &chunk.data);
-            (CompressionMethod::Store, chunk.data.clone())
+            sync_predictor(predictor, chunk.data);
+            (CompressionMethod::Store, chunk.data.to_vec())
         }
+    };
+
+    let (compression_method, compressed_data) = if let Some((method, data)) = bcj_candidate {
+        if data.len() < compressed_data.len() {
+            predictor_synced = false;
+            (method, data)
+        } else {
+            (compression_method, compressed_data)
+        }
+    } else {
+        (compression_method, compressed_data)
     };
 
     Ok(CompressedChunk {
@@ -307,6 +360,14 @@ pub fn decompress_chunk(
     }
 
     match method {
+        CompressionMethod::BcjZstd => {
+            let mut original = zstd_fallback::decompress(compressed_data, uncompressed_size)?;
+            bcj::decode_x86(&mut original);
+            if predictor_synced {
+                sync_predictor(predictor, &original);
+            }
+            Ok(original)
+        }
         CompressionMethod::BytePlanePredictorRans => {
             let original =
                 byteplane_preprocess::byteplane_decode(compressed_data, uncompressed_size)?;
@@ -481,13 +542,13 @@ pub fn decompress_chunk(
 }
 
 /// Try Zstd, then Store — used when predictor paths expanded the data.
-fn try_zstd_or_store(chunk: &Chunk) -> (CompressionMethod, Vec<u8>) {
-    if let Ok(zstd_bytes) = zstd_fallback::compress(&chunk.data) {
+fn try_zstd_or_store(chunk: &ChunkRef<'_>) -> (CompressionMethod, Vec<u8>) {
+    if let Ok(zstd_bytes) = zstd_fallback::compress(chunk.data) {
         if zstd_bytes.len() < chunk.data.len() {
             return (CompressionMethod::Zstd, zstd_bytes);
         }
     }
-    (CompressionMethod::Store, chunk.data.clone())
+    (CompressionMethod::Store, chunk.data.to_vec())
 }
 
 /// Feed data through the predictor to keep cross-block state in sync.

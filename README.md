@@ -2,11 +2,11 @@
 
 [![CI](https://github.com/craton-co/aether-arch/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/aether-arch/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV: 1.85.0](https://img.shields.io/badge/MSRV-1.85.0-brightgreen.svg)](https://blog.rust-lang.org/)
+[![MSRV: 1.88.0](https://img.shields.io/badge/MSRV-1.88.0-brightgreen.svg)](https://blog.rust-lang.org/)
 
 A next-generation file archiver built in Rust that combines neural-probabilistic prediction with custom range coding, content-defined chunking, semantic solid archiving, and adaptive routing.
 
-**Status**: 0.2.3 — 285 tests (128 unit + 87 integration + 28 FFI + 41 server + 1 doc), 6 crates, encryption, streaming, dictionary pretraining, REST API, Wasm target
+**Status**: 0.3.0 — ratio/speed profiles, x86 BCJ filtering, zero-copy chunk views, prefix-compressed metadata, encryption, streaming, dictionary pretraining, REST API, and Wasm target
 
 ```
 Tool             Ratio     vs AetherArch   Corpus
@@ -27,7 +27,7 @@ AetherArch replaces the fixed Huffman/LZ77 model of gzip with a multi-stage adap
 Input files
   │
   ▼
-Content-Defined Chunking (FastCDC, 16-512-4096 KiB)
+Content-Defined Chunking (FastCDC, 16-512-8192 KiB)
   │
   ▼
 Entropy Analysis + Content-Type Detection
@@ -97,6 +97,18 @@ aet compress mydir/ -o archive.aet --dictionary domain.aed
 aet extract archive.aet -o output_dir/ --dictionary domain.aed
 ```
 
+### Compression Profiles
+
+```bash
+aet compress mydir/ -o archive.aet --profile archival  # ratio-first default
+aet compress mydir/ -o archive.aet --profile balanced  # fast binary/image groups
+aet compress mydir/ -o archive.aet --profile fast      # BCJ/Zstandard/Store
+```
+
+Profiles are selected per semantic solid group. `balanced` keeps the archival
+BWT/NeuralSSM path for text and numeric groups while routing executables,
+images, and binary groups through fast BCJ/Zstandard candidates.
+
 ### Archive Migration
 
 ```bash
@@ -129,11 +141,12 @@ aet bench mydir/ --compare                             # compare with gzip, bzip
 ## Library Usage
 
 ```rust
-use aether_core::pipeline::compress::Compressor;
+use aether_core::pipeline::compress::{CompressionProfile, Compressor};
 use aether_core::pipeline::decompress::Decompressor;
 
 // Compress
-let stats = Compressor::new()
+let stats = Compressor::new(/* predictor factory */)
+    .with_profile(CompressionProfile::Balanced)
     .compress_to_archive(&["mydir/"], "archive.aet")?;
 
 // Extract
@@ -252,7 +265,7 @@ Binary, little-endian. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for full spec
 | `fastcdc` | 3 | Content-defined chunking (v2020 algorithm) |
 | `zstd` | 0.13 | Fallback compression for high-entropy data |
 | `blake3` | 1 | BLAKE3 integrity checksums |
-| `lz4_flex` | =0.11.3 | LZ4 compression (pure Rust, pinned for format stability) |
+| `lz4_flex` | =0.11.6 | LZ4 compression (pure Rust, pinned for format stability) |
 | `divsufsort` | 2 | Pure-Rust suffix array for BWT |
 | `byteorder` | 1 | Little-endian binary serialization |
 | `thiserror` | 2 | Error type derivation |
@@ -305,7 +318,7 @@ cargo install --path aether-cli
 aet --help
 ```
 
-Minimum supported Rust version: **1.85.0**
+Minimum supported Rust version: **1.88.0**
 
 ## What's Missing
 

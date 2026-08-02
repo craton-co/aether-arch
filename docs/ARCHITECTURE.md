@@ -53,7 +53,7 @@ Offset  Section                     Size
 ```
 Offset  Field                Type      Description
 ──────  ───────────────────  ────────  ──────────────────────────
-0       magic                [u8; 8]   0xAE "ther" 0x00 0x01 0x00
+0       magic                [u8; 8]   0xAE "ther" 0x00 0x01 0x02
 8       flags                u16       Bitfield (see below)
 10      predictor_id         u16       PredictorId enum value
 12      file_count           u32       Number of files in archive
@@ -70,6 +70,7 @@ Offset  Field                Type      Description
 - Bit 1 (`0x0002`): `FLAG_SOLID_ARCHIVE` — solid grouping enabled
 - Bit 2 (`0x0004`): `FLAG_ENCRYPTED` — archive uses AES-256-GCM or ChaCha20-Poly1305 encryption
 - Bit 3 (`0x0008`): `FLAG_HAS_DICTIONARY` — archive includes a pretrained dictionary
+- Bit 4 (`0x0010`): `FLAG_PATH_PREFIXES` — file paths share prefixes with the previous entry
 
 ### Encryption Header (57 bytes, optional)
 
@@ -204,6 +205,8 @@ magic                u32          0xAE454E44 ("AE" + "END")
 | 3 | `LzPredictorRans` | LZ4 + predictor + range coding |
 | 4 | `Lz77PredictorRans` | LZ77 + predictor + range coding |
 | 5 | `BwtPredictorRans` | BWT + MTF + RLE + predictor + range coding |
+| 6 | `BytePlanePredictorRans` | Numeric byte-plane splitting + range coding |
+| 7 | `BcjZstd` | x86/x86-64 BCJ normalization + Zstandard |
 
 ### Predictor ID Values
 
@@ -240,7 +243,7 @@ magic                u32          0xAE454E44 ("AE" + "END")
                            │
                     ┌──────▼───────┐
                     │  Per-Group   │  Files concatenated within group
-                    │  Chunking    │  FastCDC (16-512-4096 KiB)
+                    │  Chunking    │  FastCDC (16-512-8192 KiB)
                     └──────┬───────┘  (chunker.rs)
                            │
               ┌────────────▼────────────┐
@@ -506,6 +509,13 @@ The predictor is reset at the start of each block (`predictor.reset()`), ensurin
 
 ## Adaptive Routing
 
+Routing is profile-aware per semantic solid group:
+
+- `archival` evaluates the full ratio-first cascade.
+- `balanced` retains archival routing for text/numeric groups and uses
+  BCJ/Zstandard/Store for executable, image, and binary groups.
+- `fast` uses BCJ/Zstandard/Store for every group.
+
 ### The Routing Cascade (router.rs)
 
 When the analyzer recommends `PredictorRans` for a chunk, the router tries multiple transforms and picks the smallest:
@@ -533,7 +543,10 @@ The BWT path uses its own internal `NeuralSsmPredictor` regardless of which pred
 
 ### Predictor Sync
 
-After the routing cascade selects a winner, the main predictor must be synchronized to maintain cross-block state. For the BWT path, the main predictor is fed the original uncompressed data so its state reflects what was compressed (even though a different predictor did the actual work).
+Predictor-coded blocks reset at block boundaries. Under the `threading` feature,
+chunks within a solid group therefore use independent predictors and are
+compressed in parallel; ordered collection preserves deterministic block
+layout. Dictionary baselines are installed on every per-chunk predictor.
 
 **Sync skip**: When BWT wins decisively (`bwt_decisive`), the sync step is omitted. Subsequent chunks of the same content type will also use BWT (with its own internal predictor), so the group predictor's cross-block state will not be consumed by any LZ77 or plain-RC path block. This avoids an O(n) per-byte predict+update pass through the group predictor for each chunk — a significant saving for expensive predictors like NeuralSsm or ContextMixer.
 
@@ -558,7 +571,7 @@ High-entropy data (>7.5 bpb) goes directly to Zstd. Near-random data (>7.95 bpb)
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `chunker.rs` | 152 | FastCDC (16-512-4096 KiB) + fixed-size fallback |
+| `chunker.rs` | 190 | FastCDC (16-512-8192 KiB), owned public chunks + zero-copy internal views |
 | `analyzer.rs` | 267 | Content-type detection (ELF, PE, JPEG, PNG, PDF, ZIP, etc.), entropy routing |
 | `grouper.rs` | 176 | Semantic solid grouping by content type |
 

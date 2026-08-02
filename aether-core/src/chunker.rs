@@ -28,11 +28,40 @@ pub struct Chunk {
     pub entropy: f64,
 }
 
+/// A zero-copy view over a content-defined chunk.
+///
+/// Compression internals use this type while the input file buffer is alive,
+/// avoiding a second allocation and copy for every chunk. [`Chunk`] and the
+/// existing owned chunking functions remain available for API compatibility.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkRef<'a> {
+    /// Offset within the original input stream.
+    pub offset: u64,
+    /// Length in bytes.
+    pub length: usize,
+    /// Borrowed raw chunk data.
+    pub data: &'a [u8],
+    /// BLAKE3 hash of `data`.
+    pub blake3_hash: [u8; 32],
+    /// Shannon entropy of `data` (bits per byte, 0.0..8.0).
+    pub entropy: f64,
+}
+
 /// Break a byte slice into content-defined chunks.
 ///
 /// Each chunk has its BLAKE3 hash and Shannon entropy precomputed,
 /// ready for dedup detection and routing decisions.
 pub fn chunk_data(data: &[u8]) -> Vec<Chunk> {
+    chunk_data_refs(data)
+        .into_iter()
+        .map(ChunkRef::to_owned)
+        .collect()
+}
+
+/// Break a byte slice into borrowed content-defined chunk views.
+///
+/// The returned views borrow `data`; no chunk payload is cloned.
+pub fn chunk_data_refs(data: &[u8]) -> Vec<ChunkRef<'_>> {
     if data.is_empty() {
         return Vec::new();
     }
@@ -42,11 +71,11 @@ pub fn chunk_data(data: &[u8]) -> Vec<Chunk> {
     let mut chunks = Vec::new();
 
     for entry in chunker {
-        let chunk_data = data[entry.offset..entry.offset + entry.length].to_vec();
-        let hash = blake3::hash(&chunk_data);
-        let entropy = shannon_entropy(&chunk_data);
+        let chunk_data = &data[entry.offset..entry.offset + entry.length];
+        let hash = blake3::hash(chunk_data);
+        let entropy = shannon_entropy(chunk_data);
 
-        chunks.push(Chunk {
+        chunks.push(ChunkRef {
             offset: entry.offset as u64,
             length: entry.length,
             data: chunk_data,
@@ -60,16 +89,24 @@ pub fn chunk_data(data: &[u8]) -> Vec<Chunk> {
 
 /// Break a byte slice into fixed-size blocks (fallback for small inputs).
 pub fn chunk_fixed(data: &[u8], block_size: usize) -> Vec<Chunk> {
+    chunk_fixed_refs(data, block_size)
+        .into_iter()
+        .map(ChunkRef::to_owned)
+        .collect()
+}
+
+/// Break a byte slice into borrowed fixed-size chunk views.
+pub fn chunk_fixed_refs(data: &[u8], block_size: usize) -> Vec<ChunkRef<'_>> {
     let mut chunks = Vec::new();
     let mut offset = 0usize;
 
     while offset < data.len() {
         let end = (offset + block_size).min(data.len());
-        let chunk_data = data[offset..end].to_vec();
-        let hash = blake3::hash(&chunk_data);
-        let entropy = shannon_entropy(&chunk_data);
+        let chunk_data = &data[offset..end];
+        let hash = blake3::hash(chunk_data);
+        let entropy = shannon_entropy(chunk_data);
 
-        chunks.push(Chunk {
+        chunks.push(ChunkRef {
             offset: offset as u64,
             length: chunk_data.len(),
             data: chunk_data,
@@ -80,6 +117,18 @@ pub fn chunk_fixed(data: &[u8], block_size: usize) -> Vec<Chunk> {
     }
 
     chunks
+}
+
+impl ChunkRef<'_> {
+    fn to_owned(self) -> Chunk {
+        Chunk {
+            offset: self.offset,
+            length: self.length,
+            data: self.data.to_vec(),
+            blake3_hash: self.blake3_hash,
+            entropy: self.entropy,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +198,17 @@ mod tests {
         assert_eq!(chunks[0].length, 4096);
         assert_eq!(chunks[1].length, 4096);
         assert_eq!(chunks[2].length, 1808);
+    }
+
+    #[test]
+    fn borrowed_chunks_reference_input_without_copying() {
+        let data = vec![0x5Au8; 100_000];
+        let chunks = chunk_data_refs(&data);
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0].data.as_ptr(), data.as_ptr());
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.length).sum::<usize>(),
+            data.len()
+        );
     }
 }

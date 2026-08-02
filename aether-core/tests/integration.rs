@@ -11,7 +11,7 @@ use aether_core::entropy::context_mixer::ContextMixerConfig;
 use aether_core::entropy::{ContextMixer, Lz4AwarePredictor, Order0Model, ProbabilityPredictor};
 use aether_core::error::AetherError;
 use aether_core::format::{PredictorId, BLOCK_HEADER_SIZE};
-use aether_core::pipeline::compress::Compressor;
+use aether_core::pipeline::compress::{CompressionProfile, Compressor};
 use aether_core::pipeline::decompress::Decompressor;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -77,6 +77,37 @@ fn cm_light_factory() -> Box<dyn ProbabilityPredictor> {
 
 fn lz4_aware_factory() -> Box<dyn ProbabilityPredictor> {
     Box::new(Lz4AwarePredictor::new())
+}
+
+#[test]
+fn all_compression_profiles_roundtrip() {
+    let (base_dir, files) = sample_files();
+    for profile in [
+        CompressionProfile::Archival,
+        CompressionProfile::Balanced,
+        CompressionProfile::Fast,
+    ] {
+        let compressor = Compressor::new(order0_factory).with_profile(profile);
+        let mut archive = Cursor::new(Vec::new());
+        compressor
+            .compress_to_archive(&base_dir, &files, &mut archive)
+            .unwrap();
+        archive.set_position(0);
+
+        let output = tempfile::tempdir().unwrap();
+        Decompressor::new(order0_factory)
+            .extract_all(&mut archive, output.path())
+            .unwrap();
+        for file in &files {
+            let relative = file.strip_prefix(&base_dir).unwrap();
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                std::fs::read(output.path().join(relative)).unwrap(),
+                "profile {profile:?} failed for {}",
+                relative.display()
+            );
+        }
+    }
 }
 
 /// Shared logic for multi-file roundtrip tests.
@@ -1057,6 +1088,20 @@ mod encryption_tests {
 #[cfg(feature = "enterprise")]
 mod parallel_tests {
     use super::*;
+
+    #[test]
+    fn compression_is_deterministic_across_thread_counts() {
+        let (base_dir, files) = large_files();
+        let compress = |threads| {
+            let compressor = Compressor::new(order0_factory).with_max_threads(threads);
+            let mut output = Cursor::new(Vec::new());
+            compressor
+                .compress_to_archive(&base_dir, &files, &mut output)
+                .unwrap();
+            output.into_inner()
+        };
+        assert_eq!(compress(1), compress(4));
+    }
 
     /// Helper: compress sample files, then extract with parallel decompression
     /// and verify output matches originals byte-for-byte.

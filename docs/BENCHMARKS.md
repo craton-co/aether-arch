@@ -2,13 +2,17 @@
 
 All results captured on Windows 11 Pro, Rust 1.x (release profile), March 2026.
 
-**Current version: 0.2.4** — 285 tests, 6 crates.
+**Published baseline version: 0.2.4** — 285 tests, 6 crates. These numbers are
+historical baselines; 0.3.0 adds profile routing, BCJ, metadata prefix coding,
+zero-copy chunk views, and new CDF hot paths and must be measured separately.
 
 Speed varies significantly by corpus size:
 - **Internal (2.6 MiB)**: 3.7 MiB/s compression, 3.6 MiB/s decompression; ratio 2.75% (0.220 bpb)
 - **Silesia (202 MiB)**: 0.4 MiB/s compression (ssm), 0.3 MiB/s decompression; ratio 26.55% (2.124 bpb)
 
 Version history:
+- 0.3.0: archival/balanced/fast profiles, x86 BCJ, prefix-compressed paths,
+  zero-copy chunk views, NeuralSSM interval query, and decode prefix lookup.
 - 0.2.4: libsais SA-IS (O(n) vs divsufsort O(n log n)), entropy-based BWT skip (>7.0 bps).
 - 0.2.2: benchmarks against zstd/brotli/lz4, Wasm target, examples, performance optimization.
 - 0.2.1: dictionary pretraining, compression analytics, archive migration, REST API server, cloud backends.

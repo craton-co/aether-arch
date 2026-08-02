@@ -21,6 +21,33 @@ pub const PROB_TOTAL: u32 = 1 << PROB_BITS; // 32768
 /// Range is renormalized when it drops below this threshold (2^24).
 const TOP: u32 = 1 << 24;
 
+/// Resolve a cumulative frequency to its symbol.
+///
+/// BWT+MTF+RLE streams are heavily concentrated on RUNA/RUNB (symbols 0 and
+/// 1), so two prefix checks avoid the full binary search for the common case.
+/// The remaining symbols use a bounded binary search starting at symbol 2.
+#[inline(always)]
+fn find_symbol(cdf: &[u16; 257], freq: u32) -> usize {
+    if freq < cdf[1] as u32 {
+        return 0;
+    }
+    if freq < cdf[2] as u32 {
+        return 1;
+    }
+
+    let mut lo = 2usize;
+    let mut hi = 256usize;
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        if (cdf[mid + 1] as u32) <= freq {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 // ─── CDF Conversion ─────────────────────────────────────────────────────
 
 /// Convert a 256-element `f32` probability distribution to a cumulative
@@ -184,7 +211,7 @@ impl RangeEncoder {
     /// Equivalent to `encode_cdf(symbol, &cdf)` when `cdf_lo == cdf[symbol]`
     /// and `cdf_hi == cdf[symbol + 1]`, but skips materialising the other
     /// 255 entries — the encoder never reads them. Paired with
-    /// [`ProbabilityPredictor::query_cdf`](crate::entropy::ProbabilityPredictor::query_cdf)
+    /// [`ProbabilityPredictor::query_cdf`]
     /// in the encode hot loop.
     #[inline(always)]
     pub fn encode_interval(&mut self, cdf_lo: u16, cdf_hi: u16) {
@@ -312,21 +339,11 @@ impl<'a> RangeDecoder<'a> {
         );
         let freq = (self.code / r).min(PROB_TOTAL - 1);
 
-        // Binary search: find `s` where `cdf[s] <= freq < cdf[s+1]`.
-        let mut lo = 0usize;
-        let mut hi = 256usize;
-        while lo < hi {
-            let mid = (lo + hi) >> 1;
-            if (cdf[mid + 1] as u32) <= freq {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
+        let symbol = find_symbol(cdf, freq);
 
-        let cum = cdf[lo] as u32;
-        let sym_freq = (cdf[lo + 1] - cdf[lo]) as u32;
-        debug_assert!(sym_freq > 0, "zero-frequency symbol {lo}");
+        let cum = cdf[symbol] as u32;
+        let sym_freq = (cdf[symbol + 1] - cdf[symbol]) as u32;
+        debug_assert!(sym_freq > 0, "zero-frequency symbol {symbol}");
 
         self.code -= cum * r;
         self.range = sym_freq * r;
@@ -337,7 +354,7 @@ impl<'a> RangeDecoder<'a> {
             self.range <<= 8;
         }
 
-        lo as u8
+        symbol as u8
     }
 }
 
@@ -493,6 +510,29 @@ mod tests {
     #[cfg(feature = "context-mixer")]
     use crate::entropy::context_mixer::{ContextMixer, ContextMixerConfig};
     use crate::entropy::order0::Order0Model;
+
+    #[test]
+    fn prefix_symbol_lookup_matches_exhaustive_reference() {
+        let mut frequencies = [1u16; 256];
+        frequencies[0] = 12_000;
+        frequencies[1] = 8_000;
+        frequencies[2] = 4_000;
+        let assigned: u32 = frequencies.iter().map(|&value| value as u32).sum();
+        frequencies[255] = frequencies[255].saturating_add((PROB_TOTAL - assigned) as u16);
+
+        let mut cdf = [0u16; 257];
+        for symbol in 0..256 {
+            cdf[symbol + 1] = cdf[symbol] + frequencies[symbol];
+        }
+        assert_eq!(cdf[256], PROB_TOTAL as u16);
+
+        for freq in 0..PROB_TOTAL {
+            let expected = (0..256)
+                .find(|&symbol| freq < cdf[symbol + 1] as u32)
+                .unwrap();
+            assert_eq!(find_symbol(&cdf, freq), expected);
+        }
+    }
 
     /// Reference (pre-optimization) implementation of `probs_to_cdf`,
     /// kept verbatim so we can prove bit-identity against the optimized

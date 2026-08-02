@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-30
+
 ### Added
-- Placeholder for new additions
+
+- Archival, balanced, and fast per-group compression profiles.
+- Ratio-safe x86/x86-64 BCJ preprocessing for ELF, PE, and Mach-O executables.
+- Prefix-compressed file-table paths, enabled only when the table shrinks.
+- A text/log/binary/image/tiny-file benchmark matrix runner.
+
+### Changed
+
+- Compression and transformed training use zero-copy borrowed chunk views.
+- NeuralSSM uses an encode-only CDF interval query, monotone quantization, and
+  an interpolated sigmoid lookup table.
+- Range decoding accelerates common RUNA/RUNB symbols before binary search.
+- BWT entropy routing and transformed training share the 7.0 bps threshold.
+- Threaded builds parallelize independent chunks within solid groups while
+  retaining deterministic output order.
 
 ## [0.3.0-rc1] - TBD
 

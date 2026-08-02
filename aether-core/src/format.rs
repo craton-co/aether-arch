@@ -3,14 +3,25 @@ use crate::error::{AetherError, Result};
 // ── Magic & Version ──────────────────────────────────────────────────────────
 
 /// Magic bytes identifying an AetherArch archive: `0xAE "ther" 0x00 <major> <minor>`.
-pub const MAGIC: [u8; 8] = [0xAE, 0x74, 0x68, 0x65, 0x72, 0x00, 0x01, 0x00];
+pub const MAGIC: [u8; 8] = [0xAE, 0x74, 0x68, 0x65, 0x72, 0x00, 0x01, 0x02];
+
+/// Legacy v1.0/v1.1 magic accepted for backwards-compatible extraction.
+pub const LEGACY_MAGIC: [u8; 8] = [0xAE, 0x74, 0x68, 0x65, 0x72, 0x00, 0x01, 0x00];
 
 /// Format major version number.
 pub const FORMAT_VERSION_MAJOR: u8 = 0x01;
 
 /// Format minor version number.
-/// Bumped from 0 to 1 for BLAKE3 header integrity and encryption header v2.
-pub const FORMAT_VERSION_MINOR: u8 = 0x01;
+/// Version 2 adds BCJ blocks and prefix-compressed file-table paths.
+pub const FORMAT_VERSION_MINOR: u8 = 0x02;
+
+/// Entropy above which the expensive BWT suffix-array path is skipped.
+///
+/// This is deliberately shared by compression routing and transformed
+/// dictionary training so benchmark and training behavior cannot drift.
+/// A value of 7.0 preserves the measured ratio on borderline-entropy
+/// Silesia inputs while still avoiding BWT for near-random data.
+pub const BWT_ENTROPY_SKIP: f64 = 7.0;
 
 /// Magic bytes at the start of each compressed data block.
 pub const BLOCK_MAGIC: u32 = 0xB10C_AE01;
@@ -190,6 +201,8 @@ pub enum CompressionMethod {
     BwtPredictorRans = 5,
     /// Byte-plane splitting + per-plane Range Coding (best for numeric/float arrays)
     BytePlanePredictorRans = 6,
+    /// x86/x86-64 BCJ address normalization followed by Zstandard
+    BcjZstd = 7,
 }
 
 impl CompressionMethod {
@@ -202,6 +215,7 @@ impl CompressionMethod {
             4 => Ok(Self::Lz77PredictorRans),
             5 => Ok(Self::BwtPredictorRans),
             6 => Ok(Self::BytePlanePredictorRans),
+            7 => Ok(Self::BcjZstd),
             other => Err(AetherError::UnknownCompressionMethod(other)),
         }
     }
@@ -253,6 +267,9 @@ pub const FLAG_ENCRYPTED: u16 = 1 << 2;
 
 /// Header flag: archive was compressed with a dictionary (requires matching .aed file).
 pub const FLAG_HAS_DICTIONARY: u16 = 1 << 3;
+
+/// Header flag: file-table paths use previous-path prefix compression.
+pub const FLAG_PATH_PREFIXES: u16 = 1 << 4;
 
 // ── Shannon Entropy ──────────────────────────────────────────────────────────
 
@@ -348,6 +365,7 @@ mod tests {
             CompressionMethod::Lz77PredictorRans,
             CompressionMethod::BwtPredictorRans,
             CompressionMethod::BytePlanePredictorRans,
+            CompressionMethod::BcjZstd,
         ] {
             let v = m as u8;
             assert_eq!(CompressionMethod::from_u8(v).unwrap(), m);
