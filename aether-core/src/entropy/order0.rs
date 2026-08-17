@@ -101,29 +101,30 @@ impl ProbabilityPredictor for Order0Model {
     /// **Correctness contract.** The decoder uses `predict_cdf`, which:
     /// 1. computes each `cdf[i]` by cumulative integer rounding, then
     /// 2. applies a forward monotonicity fix-up that can chain — bumping
-    ///    `cdf[i]` may force bumping `cdf[i+1]`, and so on.
+    ///    `cdf[i]` may force bumping `cdf[i+1]`, and so on, and
+    /// 3. falls back to [`crate::coding::rans::probs_to_cdf`] entirely if
+    ///    that fix-up pushed `cdf[256]` past `PROB_TOTAL`.
     ///
-    /// Because the fix-up is a forward sweep, the value of `cdf[byte]`
-    /// depends on whether any earlier collision propagated up to it. A
-    /// pure O(1) jump (e.g. from a Fenwick prefix sum + scale) is therefore
-    /// not bit-identical to the reference and would silently desync the
-    /// decoder. We instead simulate the original forward sweep, but only
-    /// up to index `byte + 1` — saving:
+    /// All three steps must be reproduced exactly. Step 3 is the subtle
+    /// one: it is a *whole-table* decision, so it cannot be observed from a
+    /// sweep that stops at `byte + 1`. An earlier revision only checked the
+    /// `s == 255` anchor and trusted the invariant elsewhere; that silently
+    /// desynchronised encoder and decoder on skewed distributions (e.g. the
+    /// float-exponent planes fed to `byteplane_encode`), producing archives
+    /// whose blocks failed to decode. See
+    /// `query_cdf_matches_predict_cdf_on_skewed_counts`.
     ///
-    /// * the upper `255 - s` rounding ops
-    /// * the monotonicity fix-up over the upper half
-    /// * the `cdf[256] != PROB_TOTAL` guard scan
-    /// * the 514-byte stack return of the `[u16; 257]` array
+    /// Two regimes:
     ///
-    /// This is the "incremental" fast path that matches the trait doc:
-    /// the encoder no longer materialises the 254 entries it never reads.
-    ///
-    /// The full `predict_cdf` fallback (overshoot ⇒ `probs_to_cdf`) cannot
-    /// be detected from a partial sweep. Empirically it doesn't fire under
-    /// Laplace prior + rescale; the s==255 anchor check defends against
-    /// the only case we can detect, falling back to `predict_cdf` if our
-    /// sweep didn't land exactly on `PROB_TOTAL`. For s < 255 we trust the
-    /// invariant (counts ≥ 1, total ≤ 1_000_000) holds.
+    /// * `total <= PROB_TOTAL` — every symbol holds at least one count
+    ///   (Laplace prior), so every rounded gap is `>= 1`, the fix-up never
+    ///   fires and overshoot is impossible. The partial sweep up to
+    ///   `byte + 1` is then exact, and the upper `254 - s` rounding
+    ///   divisions, the fix-up sweep, and the 514-byte `[u16; 257]` return
+    ///   are all skipped.
+    /// * `total > PROB_TOTAL` — a rounded gap can collapse to zero, so we
+    ///   replay the full forward sweep (without materialising the table)
+    ///   and delegate to `predict_cdf` when it would have overshot.
     fn query_cdf(&mut self, byte: u8) -> (u16, u16) {
         use crate::coding::rans::PROB_TOTAL;
         let s = byte as usize;
@@ -131,49 +132,52 @@ impl ProbabilityPredictor for Order0Model {
         let half = total / 2;
         let scale = PROB_TOTAL as u64;
 
-        // Forward sweep over indices 0..=s+1 of the original predict_cdf
-        // loop, computing cdf[i] = round(running_cum * PROB_TOTAL / total)
-        // and applying the chained monotonicity fix-up. We only retain
-        // cdf[s] and cdf[s+1]; the upper 254 entries are not computed at
-        // all. The Fenwick tree (built on update) is also used in the
-        // overshoot-detection fallback below.
-        //
-        // Why a forward sweep and not an O(1) jump from Fenwick prefix
-        // sums: the fix-up `cdf[i+1] = max(cdf[i+1], cdf[i] + 1)` can
-        // chain — bumping cdf[i] may force bumping cdf[i+1], and so on —
-        // so cdf[s] depends on every prior fix-up. We must replay them.
-        let mut prev: u16 = 0; // cdf[0] = 0
-        let mut running_cum: u64 = 0;
-        let upper = s + 1;
+        if total <= scale {
+            // No fix-up possible: gap_i = round((cum+c_i)·S/T) - round(cum·S/T)
+            // is at least floor(c_i · S / T) >= 1 because c_i >= 1 and T <= S.
+            let mut cum: u64 = 0;
+            for &count in &self.counts[..s] {
+                cum += count as u64;
+            }
+            let lo = ((cum * scale + half) / total) as u16;
+            let hi = if s == 255 {
+                PROB_TOTAL as u16
+            } else {
+                (((cum + self.counts[s] as u64) * scale + half) / total) as u16
+            };
+            return (lo, hi);
+        }
+
+        // Full forward sweep, mirroring predict_cdf's rounding + chained
+        // monotonicity fix-up, but keeping only the two entries we need.
+        // `prev` ends as cdf[255], which is what decides the overshoot.
+        let mut prev: u16 = 0; // cdf[0] == 0
+        let mut cum: u64 = 0;
         let mut cdf_s: u16 = 0;
         let mut cdf_s1: u16 = 0;
-        for i in 1..=upper {
-            running_cum += self.counts[i - 1] as u64;
-            let mut val = ((running_cum * scale + half) / total) as u16;
+        for i in 1..256 {
+            cum += self.counts[i - 1] as u64;
+            let mut val = ((cum * scale + half) / total) as u16;
             if val <= prev {
                 val = prev + 1;
             }
             if i == s {
                 cdf_s = val;
-            }
-            if i == s + 1 {
+            } else if i == s + 1 {
                 cdf_s1 = val;
             }
             prev = val;
         }
-        // For s == 0, cdf[s] = cdf[0] = 0 (loop never sets it).
-        if s == 0 {
-            cdf_s = 0;
-        }
 
-        // Anchor check: if s == 255, predict_cdf forces cdf[256] = PROB_TOTAL.
-        // Our forward sweep computed cdf_s1 from rounding alone; if it doesn't
-        // match the anchor, predict_cdf would fall through to its overshoot
-        // path (`probs_to_cdf`), which can shift earlier entries too. Fall
-        // back to the reference impl in that case to guarantee match.
-        if s + 1 == 256 && cdf_s1 != PROB_TOTAL as u16 {
+        // predict_cdf pins cdf[256] = PROB_TOTAL and then bumps it when
+        // cdf[255] >= PROB_TOTAL; that bump is exactly its overshoot
+        // condition, which rebuilds the whole table via probs_to_cdf.
+        if prev >= PROB_TOTAL as u16 {
             let cdf = self.predict_cdf();
             return (cdf[s], cdf[s + 1]);
+        }
+        if s == 255 {
+            cdf_s1 = PROB_TOTAL as u16;
         }
 
         (cdf_s, cdf_s1)
@@ -310,6 +314,83 @@ mod tests {
         for &p in &probs {
             assert!((p - expected).abs() < 1e-6);
         }
+    }
+
+    /// Differential guard for the encode-side `query_cdf` fast path.
+    ///
+    /// The decoder always calls `predict_cdf`, so any disagreement between
+    /// the two silently desynchronises the range coder. This walks a set of
+    /// count distributions chosen to exercise both `query_cdf` regimes —
+    /// including heavily skewed ones where `predict_cdf`'s monotonicity
+    /// fix-up overshoots and it rebuilds the table via `probs_to_cdf`.
+    #[test]
+    fn query_cdf_matches_predict_cdf_on_skewed_counts() {
+        // (dominant symbol, repetitions) — large repetition counts push
+        // `total` far past PROB_TOTAL, which is what collapses the rounded
+        // gaps of the rare symbols to zero.
+        let shapes: [(u8, usize); 6] = [
+            (0, 100),
+            (0, 32_000),
+            (7, 200_000),
+            (255, 500_000),
+            (128, 900_000),
+            (3, 1_200_000), // crosses the rescale threshold
+        ];
+
+        for (dominant, reps) in shapes {
+            let mut model = Order0Model::new();
+            for i in 0..reps {
+                // Mostly the dominant symbol, with a thin tail of others so
+                // the distribution is skewed rather than degenerate.
+                if i % 4096 == 0 {
+                    model.update(((i / 4096) % 256) as u8);
+                } else {
+                    model.update(dominant);
+                }
+            }
+
+            let reference = model.predict_cdf();
+            for symbol in 0..=255u8 {
+                let (lo, hi) = model.query_cdf(symbol);
+                let s = symbol as usize;
+                assert_eq!(
+                    (lo, hi),
+                    (reference[s], reference[s + 1]),
+                    "query_cdf disagrees with predict_cdf for symbol {symbol}                      (dominant={dominant}, reps={reps}, total={})",
+                    model.total,
+                );
+            }
+        }
+    }
+
+    /// Round-trip guard at the range-coder level: encode with `query_cdf`
+    /// (what `rans::encode_block` uses) and decode with `predict_cdf`.
+    #[test]
+    fn skewed_stream_round_trips_through_range_coder() {
+        // A float-exponent-like plane: one dominant value, a handful of
+        // neighbours, and a long thin tail. This is the shape that broke
+        // byte-plane decoding before the `query_cdf` overshoot fix.
+        let mut data = Vec::with_capacity(200_000);
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let r = x >> 20; // 12 bits
+            data.push(match r {
+                0..=3800 => 130,
+                3801..=4000 => 129,
+                4001..=4050 => 131,
+                _ => (r % 256) as u8,
+            });
+        }
+
+        let mut encoder = Order0Model::new();
+        let encoded = crate::coding::rans::encode_block(&data, &mut encoder).unwrap();
+
+        let mut decoder = Order0Model::new();
+        let decoded =
+            crate::coding::rans::decode_block(&encoded, data.len(), &mut decoder).unwrap();
+
+        assert_eq!(decoded, data, "Order0 range-coder round-trip mismatch");
     }
 
     #[test]

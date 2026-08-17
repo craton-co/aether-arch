@@ -411,13 +411,10 @@ pub fn decompress_chunk(
 
             let rc_bytes = &compressed_data[9..];
 
-            let mut bwt_predictor = NeuralSsmPredictor::new();
             // Stage A: mirror the encoder — seed the BWT decode predictor with
             // the same dictionary baseline the encoder used, so reset() (called
             // inside decode_block) restores the identical starting state.
-            if let Some(baseline) = predictor.coding_baseline() {
-                bwt_predictor.set_dict_baseline(baseline);
-            }
+            let mut bwt_predictor = coding_predictor(predictor);
             let encode_data = rans::decode_block(rc_bytes, encoded_len, &mut bwt_predictor)?;
 
             // Undo RLE if applied, then undo BWT+MTF
@@ -456,7 +453,8 @@ pub fn decompress_chunk(
 
             let rc_bytes = &compressed_data[4..];
 
-            let lz_bytes = rans::decode_block(rc_bytes, lz_len, predictor)?;
+            let mut lz_predictor = coding_predictor(predictor);
+            let lz_bytes = rans::decode_block(rc_bytes, lz_len, &mut lz_predictor)?;
             let original = lz77_preprocess::lz77_decode(&lz_bytes, uncompressed_size)?;
 
             // Sync group predictor on the decompressed original data to match
@@ -491,7 +489,8 @@ pub fn decompress_chunk(
 
                 let rc_bytes = &compressed_data[4..];
 
-                let lz_bytes = rans::decode_block(rc_bytes, lz_len, predictor)?;
+                let mut lz_predictor = coding_predictor(predictor);
+                let lz_bytes = rans::decode_block(rc_bytes, lz_len, &mut lz_predictor)?;
                 let original = lz_preprocess::lz_decode(&lz_bytes, uncompressed_size)?;
 
                 // Sync group predictor on decompressed data (see LZ77 note above).
@@ -509,7 +508,9 @@ pub fn decompress_chunk(
             }
         }
         CompressionMethod::PredictorRans => {
-            let original = rans::decode_block(compressed_data, uncompressed_size, predictor)?;
+            let mut plain_predictor = coding_predictor(predictor);
+            let original =
+                rans::decode_block(compressed_data, uncompressed_size, &mut plain_predictor)?;
 
             // Sync group predictor on decompressed data (see LZ77 note above).
             if predictor_synced {
@@ -557,4 +558,24 @@ fn sync_predictor(predictor: &mut dyn ProbabilityPredictor, data: &[u8]) {
         predictor.predict();
         predictor.update(byte);
     }
+}
+
+/// Build the coding predictor the *encoder* used for a predictor-backed
+/// block payload.
+///
+/// [`compress_chunk`] range-codes every predictor path (BWT, LZ77, plain,
+/// byte-plane) with a scratch [`NeuralSsmPredictor`] rather than with the
+/// group predictor — it has always done so, since the first release. The
+/// decoder must therefore build the *same* predictor, not the group
+/// predictor, or the two sides disagree on the CDF for every symbol.
+///
+/// `group` supplies only the dictionary coding baseline, mirroring
+/// `compress_chunk`'s `scratch.set_dict_baseline(...)`, so `reset()` inside
+/// `decode_block` restores the identical starting state.
+fn coding_predictor(group: &dyn ProbabilityPredictor) -> NeuralSsmPredictor {
+    let mut predictor = NeuralSsmPredictor::new();
+    if let Some(baseline) = group.coding_baseline() {
+        predictor.set_dict_baseline(baseline);
+    }
+    predictor
 }
