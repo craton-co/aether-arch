@@ -65,6 +65,28 @@ pub trait ProbabilityPredictor: Send {
         (cdf[s], cdf[s + 1])
     }
 
+    /// Resolve the symbol whose CDF interval contains `freq`, returning
+    /// `(symbol, cdf[symbol], cdf[symbol + 1])`.
+    ///
+    /// **Decode-only fast path**, the mirror of [`query_cdf`](Self::query_cdf).
+    /// The decoder holds a cumulative frequency in `[0, PROB_TOTAL)` and needs
+    /// the one interval containing it; the other 255 intervals are never read.
+    /// The default implementation materialises the full table via
+    /// [`predict_cdf`](Self::predict_cdf) and binary-searches it, so existing
+    /// predictors keep working unchanged.
+    ///
+    /// Predictors whose CDF is expensive to build should override this with a
+    /// search that evaluates only the `O(log 256)` boundaries the search
+    /// actually visits. The result **must** be bit-identical to what
+    /// `predict_cdf()` would have produced for the same state — the encoder
+    /// still commits to `query_cdf`/`predict_cdf` values, so any divergence
+    /// silently desynchronises the range coder.
+    fn decode_symbol(&mut self, freq: u32) -> (u8, u16, u16) {
+        let cdf = self.predict_cdf();
+        let symbol = crate::coding::rans::find_symbol(&cdf, freq);
+        (symbol as u8, cdf[symbol], cdf[symbol + 1])
+    }
+
     /// Feed a confirmed byte to update internal state.
     ///
     /// Called after encoding (compressor) or decoding (decompressor) each byte.

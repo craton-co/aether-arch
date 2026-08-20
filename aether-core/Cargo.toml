@@ -40,6 +40,10 @@ proptest = "1"
 name = "compression"
 harness = false
 
+[[bench]]
+name = "decompression"
+harness = false
+
 [features]
 default = ["context-mixer", "lz4", "bwt-encode"]
 ## BWT encoding via libsais (C FFI). Required for compression.

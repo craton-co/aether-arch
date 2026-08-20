@@ -27,7 +27,7 @@ const TOP: u32 = 1 << 24;
 /// 1), so two prefix checks avoid the full binary search for the common case.
 /// The remaining symbols use a bounded binary search starting at symbol 2.
 #[inline(always)]
-fn find_symbol(cdf: &[u16; 257], freq: u32) -> usize {
+pub(crate) fn find_symbol(cdf: &[u16; 257], freq: u32) -> usize {
     if freq < cdf[1] as u32 {
         return 0;
     }
@@ -331,21 +331,42 @@ impl<'a> RangeDecoder<'a> {
     /// Decode one symbol using a CDF table.
     #[inline(always)]
     pub fn decode_cdf(&mut self, cdf: &[u16; 257]) -> u8 {
+        let (r, freq) = self.decode_freq();
+        let symbol = find_symbol(cdf, freq);
+        self.advance(r, cdf[symbol], cdf[symbol + 1]);
+        symbol as u8
+    }
+
+    /// Split half of [`decode_cdf`]: the scale factor and the cumulative
+    /// frequency the next symbol's interval must contain.
+    ///
+    /// Splitting the decode step lets the *predictor* resolve the symbol
+    /// (see [`ProbabilityPredictor::decode_symbol`]), which for models whose
+    /// CDF is expensive to materialise is far cheaper than building all 257
+    /// entries and then binary-searching them.
+    #[inline(always)]
+    pub fn decode_freq(&self) -> (u32, u32) {
         let r = self.range / PROB_TOTAL;
         // V6: after renormalization range >= TOP (2^24), so r >= 2^24 / 2^15 = 512.
         debug_assert!(
             r > 0,
             "range/PROB_TOTAL must be positive after renormalization"
         );
-        let freq = (self.code / r).min(PROB_TOTAL - 1);
+        (r, (self.code / r).min(PROB_TOTAL - 1))
+    }
 
-        let symbol = find_symbol(cdf, freq);
+    /// Other half of [`decode_cdf`]: consume the resolved symbol's interval.
+    ///
+    /// `r` must be the value returned by the matching [`decode_freq`] call,
+    /// and `[cdf_lo, cdf_hi)` the interval containing that call's `freq`.
+    ///
+    /// [`decode_freq`]: Self::decode_freq
+    #[inline(always)]
+    pub fn advance(&mut self, r: u32, cdf_lo: u16, cdf_hi: u16) {
+        let sym_freq = (cdf_hi - cdf_lo) as u32;
+        debug_assert!(sym_freq > 0, "zero-frequency symbol interval");
 
-        let cum = cdf[symbol] as u32;
-        let sym_freq = (cdf[symbol + 1] - cdf[symbol]) as u32;
-        debug_assert!(sym_freq > 0, "zero-frequency symbol {symbol}");
-
-        self.code -= cum * r;
+        self.code -= cdf_lo as u32 * r;
         self.range = sym_freq * r;
 
         // Renormalize.
@@ -353,8 +374,6 @@ impl<'a> RangeDecoder<'a> {
             self.code = (self.code << 8) | self.read_byte() as u32;
             self.range <<= 8;
         }
-
-        symbol as u8
     }
 }
 
@@ -481,8 +500,13 @@ fn decode_block_inner<P: ProbabilityPredictor + ?Sized>(
     let mut output = Vec::with_capacity(safe_capacity);
 
     for _ in 0..expected_len {
-        let cdf = predictor.predict_cdf();
-        let byte = dec.decode_cdf(&cdf);
+        // Ask the predictor to resolve the symbol itself: models that can
+        // answer "which interval contains `freq`?" without building the full
+        // 257-entry table (NeuralSSM) skip ~250 quantisation steps per byte.
+        // The trait default is exactly the old `predict_cdf` + `find_symbol`.
+        let (r, freq) = dec.decode_freq();
+        let (byte, cdf_lo, cdf_hi) = predictor.decode_symbol(freq);
+        dec.advance(r, cdf_lo, cdf_hi);
         predictor.update(byte);
         output.push(byte);
     }

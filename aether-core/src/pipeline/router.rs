@@ -10,6 +10,29 @@
 //!
 //! Since encode_block resets the predictor at the start of each call,
 //! we can try multiple transforms and pick the smallest result.
+//!
+//! # Group predictor state
+//!
+//! Every predictor-backed payload — BWT, LZ77, plain and byte-plane — is
+//! range-coded by a **scratch predictor owned by this module**, not by the
+//! caller's group predictor, and both `rans::encode_block` and
+//! `rans::decode_block` call `reset()` before the first symbol. Cross-block
+//! group state is therefore never consumed on either side: a block's coding
+//! depends only on that block's bytes and (optionally) the dictionary
+//! baseline. The parallel compression path relies on the same property — it
+//! builds a fresh predictor per chunk and still produces byte-identical
+//! archives.
+//!
+//! Earlier revisions nonetheless ran a full `predict`/`update` pass over
+//! every chunk's plaintext on both sides ("sync_predictor") to keep that
+//! unread state symmetric. On the decode side that pass cost one NeuralSSM
+//! step per output byte — for `Zstd`, `Store` and `BcjZstd` blocks it was the
+//! entire cost of decompression, dwarfing the actual codec. It is gone.
+//!
+//! [`CompressedChunk::predictor_synced`] and the block header's
+//! `predictor_state_flag` are still written and read unchanged, so the
+//! on-disk format is untouched and a future predictor that genuinely carries
+//! state across blocks can reintroduce the pass without a format break.
 
 use crate::analyzer::{self, RecommendedMethod};
 use crate::chunker::ChunkRef;
@@ -39,8 +62,13 @@ pub struct CompressedChunk {
     pub original_size: usize,
     /// BLAKE3 hash of the original uncompressed data.
     pub blake3_hash: [u8; 32],
-    /// Whether `sync_predictor` was called during compression.
-    /// When `false`, the decompressor must also skip syncing to match.
+    /// Recorded per-block predictor-sync disposition, written to the block
+    /// header as `predictor_state_flag`.
+    ///
+    /// `false` for methods that code through their own internal predictor
+    /// (BWT, byte-plane, BCJ+Zstd). No decode path consumes it today — see
+    /// the module-level "Group predictor state" note — but it is preserved
+    /// so the archive format is unchanged.
     pub predictor_synced: bool,
 }
 
@@ -251,67 +279,41 @@ pub fn compress_chunk(
                 }
             }
 
-            // ── Sync predictor to the winning path ───────────────────
+            // ── Record the winning path's sync disposition ────────────
             //
-            // **Design note**: `encode_block` / `decode_block` both call
-            // `predictor.reset()` at the start of every block.  Cross-block
-            // predictor state is therefore NOT consumed by predictor-based
-            // paths (PredictorRans, LZ77, BWT).  The `sync_predictor` call
-            // below maintains advisory state for Zstd/Store paths and
-            // forward-compatible use.
-            //
-            // Previous implementation re-encoded with the winning path
-            // (calling `rans::encode_block` a second time), which:
-            //   1. Wasted CPU on a redundant encode pass.
-            //   2. Reset the group predictor via `encode_block().reset()`,
-            //      destroying accumulated cross-block state and causing
-            //      compressor/decompressor sync_predictor divergence.
-            //   3. Introduced a theoretical floating-point non-determinism
-            //      risk if the predictor ran different code paths on
-            //      different platforms.
-            //
-            // The fix: use `sync_predictor` for all winning paths.  This
-            // feeds the original chunk data through predict+update WITHOUT
-            // resetting, preserving cross-block state symmetrically with
-            // the decompressor.
+            // See the module-level "Group predictor state" note: every
+            // predictor-backed payload is coded by a scratch predictor that
+            // `encode_block`/`decode_block` reset per block, so no cross-block
+            // group state is ever consumed. `predictor_synced` is still
+            // recorded (and written to the block header as
+            // `predictor_state_flag`) so the on-disk format is unchanged and a
+            // future predictor that *does* carry state across blocks can be
+            // reintroduced without a format break.
             if let Some((method, payload)) = best {
-                match method {
-                    CompressionMethod::BwtPredictorRans
-                    | CompressionMethod::BytePlanePredictorRans => {
-                        // BWT and byte-plane both use their own internal
-                        // predictors, so the group predictor's state is not
-                        // meaningful. Skip sync to avoid O(n) waste.
-                        predictor_synced = false;
-                    }
-                    CompressionMethod::Lz77PredictorRans | CompressionMethod::PredictorRans => {
-                        // Feed original data (not the LZ77/RC encoded form)
-                        // through the predictor to maintain cross-block state.
-                        // This matches the decompressor path which also calls
-                        // sync_predictor on the decompressed original data.
-                        sync_predictor(predictor, chunk.data);
-                    }
-                    _ => {}
+                if matches!(
+                    method,
+                    CompressionMethod::BwtPredictorRans | CompressionMethod::BytePlanePredictorRans
+                ) {
+                    // BWT and byte-plane both code through their own internal
+                    // predictors, so the group predictor's state is not
+                    // meaningful for them.
+                    predictor_synced = false;
                 }
                 (method, payload)
             } else {
                 // Nothing helped — fall back to zstd/store
-                sync_predictor(predictor, chunk.data);
                 try_zstd_or_store(chunk)
             }
         }
         RecommendedMethod::Zstd => {
             let compressed = zstd_fallback::compress(chunk.data)?;
-            sync_predictor(predictor, chunk.data);
             if compressed.len() >= chunk.data.len() {
                 (CompressionMethod::Store, chunk.data.to_vec())
             } else {
                 (CompressionMethod::Zstd, compressed)
             }
         }
-        RecommendedMethod::Store => {
-            sync_predictor(predictor, chunk.data);
-            (CompressionMethod::Store, chunk.data.to_vec())
-        }
+        RecommendedMethod::Store => (CompressionMethod::Store, chunk.data.to_vec()),
     };
 
     let (compression_method, compressed_data) = if let Some((method, data)) = bcj_candidate {
@@ -336,9 +338,14 @@ pub fn compress_chunk(
 
 /// Decompress a chunk based on its stored compression method.
 ///
-/// `predictor_synced`: if `true`, call `sync_predictor` after decompression
-/// to advance the group predictor state. If `false`, skip sync (matches the
-/// compressor's decision to skip when BWT won decisively).
+/// `predictor` supplies only the dictionary coding baseline; the payload
+/// itself is decoded by a scratch predictor built to match the encoder. See
+/// the module-level "Group predictor state" note.
+///
+/// `predictor_synced` mirrors the block header's `predictor_state_flag`. No
+/// decode path consumes it today — it is accepted so callers keep passing the
+/// archive's value through, which keeps the door open for a future predictor
+/// with genuine cross-block state.
 ///
 /// # Safety Limits
 ///
@@ -349,7 +356,7 @@ pub fn decompress_chunk(
     method: CompressionMethod,
     uncompressed_size: usize,
     predictor: &mut dyn ProbabilityPredictor,
-    predictor_synced: bool,
+    _predictor_synced: bool,
 ) -> Result<Vec<u8>> {
     // Bounds check: reject implausibly large decompressed sizes
     if uncompressed_size > MAX_DECOMPRESSED_BLOCK_SIZE {
@@ -363,17 +370,11 @@ pub fn decompress_chunk(
         CompressionMethod::BcjZstd => {
             let mut original = zstd_fallback::decompress(compressed_data, uncompressed_size)?;
             bcj::decode_x86(&mut original);
-            if predictor_synced {
-                sync_predictor(predictor, &original);
-            }
             Ok(original)
         }
         CompressionMethod::BytePlanePredictorRans => {
             let original =
                 byteplane_preprocess::byteplane_decode(compressed_data, uncompressed_size)?;
-            if predictor_synced {
-                sync_predictor(predictor, &original);
-            }
             Ok(original)
         }
         CompressionMethod::BwtPredictorRans => {
@@ -426,9 +427,6 @@ pub fn decompress_chunk(
 
             let original =
                 bwt_preprocess::bwt_mtf_decode_parts(primary_index, &mtf_data, uncompressed_size)?;
-            if predictor_synced {
-                sync_predictor(predictor, &original);
-            }
             Ok(original)
         }
         CompressionMethod::Lz77PredictorRans => {
@@ -456,14 +454,6 @@ pub fn decompress_chunk(
             let mut lz_predictor = coding_predictor(predictor);
             let lz_bytes = rans::decode_block(rc_bytes, lz_len, &mut lz_predictor)?;
             let original = lz77_preprocess::lz77_decode(&lz_bytes, uncompressed_size)?;
-
-            // Sync group predictor on the decompressed original data to match
-            // the compressor's sync_predictor(predictor, &chunk.data) call.
-            // decode_block above reset the predictor; this re-establishes
-            // cross-block state symmetry.
-            if predictor_synced {
-                sync_predictor(predictor, &original);
-            }
             Ok(original)
         }
         CompressionMethod::LzPredictorRans => {
@@ -492,11 +482,6 @@ pub fn decompress_chunk(
                 let mut lz_predictor = coding_predictor(predictor);
                 let lz_bytes = rans::decode_block(rc_bytes, lz_len, &mut lz_predictor)?;
                 let original = lz_preprocess::lz_decode(&lz_bytes, uncompressed_size)?;
-
-                // Sync group predictor on decompressed data (see LZ77 note above).
-                if predictor_synced {
-                    sync_predictor(predictor, &original);
-                }
                 Ok(original)
             }
             #[cfg(not(feature = "lz4"))]
@@ -511,20 +496,9 @@ pub fn decompress_chunk(
             let mut plain_predictor = coding_predictor(predictor);
             let original =
                 rans::decode_block(compressed_data, uncompressed_size, &mut plain_predictor)?;
-
-            // Sync group predictor on decompressed data (see LZ77 note above).
-            if predictor_synced {
-                sync_predictor(predictor, &original);
-            }
             Ok(original)
         }
-        CompressionMethod::Zstd => {
-            let data = zstd_fallback::decompress(compressed_data, uncompressed_size)?;
-            if predictor_synced {
-                sync_predictor(predictor, &data);
-            }
-            Ok(data)
-        }
+        CompressionMethod::Zstd => zstd_fallback::decompress(compressed_data, uncompressed_size),
         CompressionMethod::Store => {
             if compressed_data.len() != uncompressed_size {
                 return Err(AetherError::Decompression(format!(
@@ -533,11 +507,7 @@ pub fn decompress_chunk(
                     uncompressed_size,
                 )));
             }
-            let data = compressed_data.to_vec();
-            if predictor_synced {
-                sync_predictor(predictor, &data);
-            }
-            Ok(data)
+            Ok(compressed_data.to_vec())
         }
     }
 }
@@ -550,14 +520,6 @@ fn try_zstd_or_store(chunk: &ChunkRef<'_>) -> (CompressionMethod, Vec<u8>) {
         }
     }
     (CompressionMethod::Store, chunk.data.to_vec())
-}
-
-/// Feed data through the predictor to keep cross-block state in sync.
-fn sync_predictor(predictor: &mut dyn ProbabilityPredictor, data: &[u8]) {
-    for &byte in data {
-        predictor.predict();
-        predictor.update(byte);
-    }
 }
 
 /// Build the coding predictor the *encoder* used for a predictor-backed
