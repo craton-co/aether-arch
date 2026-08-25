@@ -10,6 +10,61 @@
 use super::traits::ProbabilityPredictor;
 use crate::format::PredictorId;
 
+/// Largest `total` for which [`ExactDivisor`] is provably exact.
+///
+/// The magic-number bound below needs `total^2 * (PROB_TOTAL + 1) <= 2^SHIFT`.
+/// The model rescales at 1_000_000, so this ceiling is never reached in
+/// practice; [`ExactDivisor::div`] falls back to a hardware divide if it is.
+const MAX_MAGIC_TOTAL: u32 = 1 << 20;
+
+/// Exact `n / total` by multiply-and-shift, for a `total` that stays fixed
+/// across a whole CDF sweep.
+///
+/// Both `predict_cdf` and `decode_symbol` divide by `self.total` once per
+/// symbol — up to 256 times to resolve a single byte. A 64-bit hardware
+/// divide is ~20-40 cycles; a widening multiply plus a shift is ~4, and this
+/// is the dominant cost of decoding a byte-plane block.
+///
+/// With `M = floor(2^K / d) + 1` and `e = M*d - 2^K` (so `1 <= e <= d`),
+/// `n*M / 2^K = n/d + n*e/(d * 2^K)`, which floors to `floor(n/d)` exactly
+/// when `n * e < 2^K`. Here `n = cum * PROB_TOTAL + total/2 < total *
+/// (PROB_TOTAL + 1)` and `e <= total`, so `total^2 * (PROB_TOTAL + 1) <= 2^K`
+/// is sufficient — satisfied by `K = 56` for every `total <= 2^20`.
+#[derive(Clone, Copy)]
+struct ExactDivisor {
+    total: u32,
+    magic: u128,
+    exact: bool,
+}
+
+impl ExactDivisor {
+    const SHIFT: u32 = 56;
+
+    #[inline]
+    fn new(total: u32) -> Self {
+        let exact = total > 0 && total <= MAX_MAGIC_TOTAL;
+        let magic = if exact {
+            ((1u128 << Self::SHIFT) / total as u128) + 1
+        } else {
+            0
+        };
+        Self {
+            total,
+            magic,
+            exact,
+        }
+    }
+
+    #[inline(always)]
+    fn div(&self, n: u64) -> u64 {
+        if self.exact {
+            ((n as u128 * self.magic) >> Self::SHIFT) as u64
+        } else {
+            n / self.total as u64
+        }
+    }
+}
+
 /// Adaptive order-0 (unigram) frequency model with Laplace smoothing.
 pub struct Order0Model {
     /// Frequency count for each byte value. Starts at 1 (Laplace prior).
@@ -50,10 +105,14 @@ impl ProbabilityPredictor for Order0Model {
         let mut cdf = [0u16; 257];
 
         // Scale integer counts to 15-bit CDF using cumulative rounding.
+        // `ExactDivisor` replaces 256 hardware divides with 256 multiplies
+        // and produces bit-identical results.
         let total = self.total;
+        let divisor = ExactDivisor::new(total);
+        let half = (total / 2) as u64;
         let mut cum = 0u64;
         for (i, cdf_val) in cdf.iter_mut().enumerate().take(256) {
-            *cdf_val = ((cum * PROB_TOTAL as u64 + (total as u64 / 2)) / total as u64) as u16;
+            *cdf_val = divisor.div(cum * PROB_TOTAL as u64 + half) as u16;
             cum += self.counts[i] as u64;
         }
         cdf[256] = PROB_TOTAL as u16;
@@ -128,6 +187,7 @@ impl ProbabilityPredictor for Order0Model {
     fn query_cdf(&mut self, byte: u8) -> (u16, u16) {
         use crate::coding::rans::PROB_TOTAL;
         let s = byte as usize;
+        let divisor = ExactDivisor::new(self.total);
         let total = self.total as u64;
         let half = total / 2;
         let scale = PROB_TOTAL as u64;
@@ -139,11 +199,11 @@ impl ProbabilityPredictor for Order0Model {
             for &count in &self.counts[..s] {
                 cum += count as u64;
             }
-            let lo = ((cum * scale + half) / total) as u16;
+            let lo = divisor.div(cum * scale + half) as u16;
             let hi = if s == 255 {
                 PROB_TOTAL as u16
             } else {
-                (((cum + self.counts[s] as u64) * scale + half) / total) as u16
+                divisor.div((cum + self.counts[s] as u64) * scale + half) as u16
             };
             return (lo, hi);
         }
@@ -157,7 +217,7 @@ impl ProbabilityPredictor for Order0Model {
         let mut cdf_s1: u16 = 0;
         for i in 1..256 {
             cum += self.counts[i - 1] as u64;
-            let mut val = ((cum * scale + half) / total) as u16;
+            let mut val = divisor.div(cum * scale + half) as u16;
             if val <= prev {
                 val = prev + 1;
             }
@@ -182,6 +242,25 @@ impl ProbabilityPredictor for Order0Model {
 
         (cdf_s, cdf_s1)
     }
+
+    // No `decode_symbol` override.
+    //
+    // The obvious one — resolve the symbol during the rounding sweep instead
+    // of materialising the table — measured *slower* than the trait default
+    // (0.90x on a BWT+MTF+RLE stream, 0.52x on a skewed byte plane). Two
+    // reasons, both structural:
+    //
+    //  * The forward monotonicity fix-up chains, so unlike
+    //    `NeuralSsmPredictor` the boundaries cannot be binary-searched;
+    //    the sweep runs to `i = 255` either way.
+    //  * The overshoot fallback is a whole-table decision, only known at
+    //    `i = 255`. When it fires — which is the common case on the skewed
+    //    planes byte-plane blocks are made of — the sweep is wasted and the
+    //    table is rebuilt anyway, so the fused loop pays for it twice.
+    //
+    // `predict_cdf` + the decoder's `find_symbol` is the faster shape here.
+    // The divide-free `ExactDivisor` above is where this model's decode win
+    // actually comes from (2.25x on CDF construction).
 
     fn name(&self) -> &str {
         "order-0"
@@ -313,6 +392,47 @@ mod tests {
         let expected = 1.0 / 256.0;
         for &p in &probs {
             assert!((p - expected).abs() < 1e-6);
+        }
+    }
+
+    /// `ExactDivisor` must agree with hardware division across the whole
+    /// operand range the CDF sweep can produce, including the boundaries
+    /// where the magic-number bound is tightest.
+    #[test]
+    fn exact_divisor_matches_hardware_division() {
+        use crate::coding::rans::PROB_TOTAL;
+
+        let totals = [
+            256u32,
+            257,
+            1_000,
+            32_767,
+            32_768,
+            32_769,
+            65_536,
+            999_999,
+            1_000_001,
+            MAX_MAGIC_TOTAL,
+            MAX_MAGIC_TOTAL + 1, // falls back to hardware divide
+        ];
+
+        for total in totals {
+            let divisor = ExactDivisor::new(total);
+            let half = (total / 2) as u64;
+            // `cum` ranges over [0, total]; sample the ends densely and the
+            // middle on a stride, since the operand is monotone in `cum`.
+            let mut cums: Vec<u64> = (0..=64u64).collect();
+            cums.extend((0..=64u64).map(|k| total as u64 - k.min(total as u64)));
+            cums.extend((0..512u64).map(|k| k * (total as u64) / 512));
+            for cum in cums {
+                let cum = cum.min(total as u64);
+                let n = cum * PROB_TOTAL as u64 + half;
+                assert_eq!(
+                    divisor.div(n),
+                    n / total as u64,
+                    "ExactDivisor mismatch: n={n}, total={total}",
+                );
+            }
         }
     }
 

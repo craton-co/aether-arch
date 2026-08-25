@@ -124,8 +124,11 @@ pub fn probs_to_cdf(probs: &[f32; 256]) -> [u16; 257] {
         // symbols (greedy, preserves distribution shape).
         let mut leftover = remaining_mass - distributed;
         if leftover > 0 {
-            // Build index sorted by descending probability
-            let mut indices: Vec<usize> = (0..N).collect();
+            // Build index sorted by descending probability. Kept on the stack:
+            // this fallback fires per *symbol* on skewed Order0 streams, and a
+            // 256-element heap allocation there is pure overhead. Same slice
+            // sort on the same input order, so the resulting CDF is unchanged.
+            let mut indices: [usize; N] = std::array::from_fn(|i| i);
             indices.sort_unstable_by(|&a, &b| {
                 clamped[b]
                     .partial_cmp(&clamped[a])
