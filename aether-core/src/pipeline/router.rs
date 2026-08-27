@@ -340,23 +340,53 @@ pub fn compress_chunk(
 ///
 /// `predictor` supplies only the dictionary coding baseline; the payload
 /// itself is decoded by a scratch predictor built to match the encoder. See
-/// the module-level "Group predictor state" note.
+/// the module-level "Group predictor state" note. Callers that already know
+/// the baseline should use [`decompress_chunk_with_baseline`] instead.
 ///
 /// `predictor_synced` mirrors the block header's `predictor_state_flag`. No
 /// decode path consumes it today — it is accepted so callers keep passing the
 /// archive's value through, which keeps the door open for a future predictor
 /// with genuine cross-block state.
-///
-/// # Safety Limits
-///
-/// Rejects `uncompressed_size` exceeding [`MAX_DECOMPRESSED_BLOCK_SIZE`] (64 MiB)
-/// to prevent out-of-memory from crafted archives.
 pub fn decompress_chunk(
     compressed_data: &[u8],
     method: CompressionMethod,
     uncompressed_size: usize,
     predictor: &mut dyn ProbabilityPredictor,
     _predictor_synced: bool,
+) -> Result<Vec<u8>> {
+    decompress_chunk_with_baseline(
+        compressed_data,
+        method,
+        uncompressed_size,
+        predictor.coding_baseline(),
+    )
+}
+
+/// Decompress a chunk, given the dictionary coding baseline directly.
+///
+/// This is what [`decompress_chunk`] does after reading the one thing it
+/// needs from the predictor it is handed. Decoding depends on the payload,
+/// the method, the expected size and the baseline — nothing else — so
+/// callers that decode many blocks (in parallel, or across solid groups) can
+/// resolve the baseline once instead of constructing a predictor per worker.
+/// That matters: a `ContextMixer` instance is ~100 MiB.
+///
+/// The baseline is `predictor.coding_baseline()`, i.e. `Some(dict.state)`
+/// only when a dictionary is configured *and* the archive's predictor type
+/// installs one (today: NeuralSSM). [`Decompressor::decode_baseline`] computes
+/// it once.
+///
+/// # Safety Limits
+///
+/// Rejects `uncompressed_size` exceeding [`MAX_DECOMPRESSED_BLOCK_SIZE`] (64 MiB)
+/// to prevent out-of-memory from crafted archives.
+///
+/// [`Decompressor::decode_baseline`]: crate::pipeline::decompress::Decompressor
+pub fn decompress_chunk_with_baseline(
+    compressed_data: &[u8],
+    method: CompressionMethod,
+    uncompressed_size: usize,
+    dict_baseline: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     // Bounds check: reject implausibly large decompressed sizes
     if uncompressed_size > MAX_DECOMPRESSED_BLOCK_SIZE {
@@ -415,7 +445,7 @@ pub fn decompress_chunk(
             // Stage A: mirror the encoder — seed the BWT decode predictor with
             // the same dictionary baseline the encoder used, so reset() (called
             // inside decode_block) restores the identical starting state.
-            let mut bwt_predictor = coding_predictor(predictor);
+            let mut bwt_predictor = coding_predictor(dict_baseline);
             let encode_data = rans::decode_block(rc_bytes, encoded_len, &mut bwt_predictor)?;
 
             // Undo RLE if applied, then undo BWT+MTF
@@ -451,7 +481,7 @@ pub fn decompress_chunk(
 
             let rc_bytes = &compressed_data[4..];
 
-            let mut lz_predictor = coding_predictor(predictor);
+            let mut lz_predictor = coding_predictor(dict_baseline);
             let lz_bytes = rans::decode_block(rc_bytes, lz_len, &mut lz_predictor)?;
             let original = lz77_preprocess::lz77_decode(&lz_bytes, uncompressed_size)?;
             Ok(original)
@@ -479,7 +509,7 @@ pub fn decompress_chunk(
 
                 let rc_bytes = &compressed_data[4..];
 
-                let mut lz_predictor = coding_predictor(predictor);
+                let mut lz_predictor = coding_predictor(dict_baseline);
                 let lz_bytes = rans::decode_block(rc_bytes, lz_len, &mut lz_predictor)?;
                 let original = lz_preprocess::lz_decode(&lz_bytes, uncompressed_size)?;
                 Ok(original)
@@ -493,7 +523,7 @@ pub fn decompress_chunk(
             }
         }
         CompressionMethod::PredictorRans => {
-            let mut plain_predictor = coding_predictor(predictor);
+            let mut plain_predictor = coding_predictor(dict_baseline);
             let original =
                 rans::decode_block(compressed_data, uncompressed_size, &mut plain_predictor)?;
             Ok(original)
@@ -531,12 +561,11 @@ fn try_zstd_or_store(chunk: &ChunkRef<'_>) -> (CompressionMethod, Vec<u8>) {
 /// decoder must therefore build the *same* predictor, not the group
 /// predictor, or the two sides disagree on the CDF for every symbol.
 ///
-/// `group` supplies only the dictionary coding baseline, mirroring
-/// `compress_chunk`'s `scratch.set_dict_baseline(...)`, so `reset()` inside
-/// `decode_block` restores the identical starting state.
-fn coding_predictor(group: &dyn ProbabilityPredictor) -> NeuralSsmPredictor {
+/// `dict_baseline` mirrors `compress_chunk`'s `scratch.set_dict_baseline(...)`,
+/// so `reset()` inside `decode_block` restores the identical starting state.
+fn coding_predictor(dict_baseline: Option<&[u8]>) -> NeuralSsmPredictor {
     let mut predictor = NeuralSsmPredictor::new();
-    if let Some(baseline) = group.coding_baseline() {
+    if let Some(baseline) = dict_baseline {
         predictor.set_dict_baseline(baseline);
     }
     predictor

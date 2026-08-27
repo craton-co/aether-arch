@@ -3,12 +3,10 @@
 //! Reads Header → FileTable → GroupTable → Blocks sequentially. Enables
 //! piped workflows: `cat archive.aet | aet extract -`.
 
-use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
 use crate::block::{BlockHeader, BlockTrailer};
-use crate::entropy::ProbabilityPredictor;
 use crate::error::{AetherError, Result};
 use crate::format::*;
 use crate::header::{ArchiveHeader, FileEntry, SolidGroupEntry};
@@ -140,8 +138,10 @@ impl Decompressor {
             &self.password,
         )?;
 
-        // Per-group predictors for correct cross-block state
-        let mut predictors: HashMap<u32, Box<dyn ProbabilityPredictor>> = HashMap::new();
+        // Blocks are independently decodable, so no per-group predictor state
+        // carries across them — only the dictionary coding baseline, which is
+        // constant. See the router's "Group predictor state" note.
+        let baseline = self.decode_baseline()?;
 
         // Decompressed blocks, indexed by sequential block position (0..N)
         let mut decompressed_blocks: Vec<Option<Vec<u8>>> = vec![None; block_count];
@@ -155,7 +155,7 @@ impl Decompressor {
         let mut total_compressed_read: u64 = 0;
         for slot in decompressed_blocks.iter_mut().take(block_count) {
             let (data, _block_id, compressed_size) =
-                self.decompress_block_streaming(archive, &mut predictors, &decrypt_key)?;
+                self.decompress_block_streaming(archive, baseline.as_deref(), &decrypt_key)?;
             total_compressed_read += compressed_size as u64;
             if total_compressed_read > MAX_TOTAL_COMPRESSED_READ_SIZE {
                 return Err(AetherError::ResourceLimitExceeded(format!(
@@ -244,7 +244,7 @@ impl Decompressor {
             corrupted_blocks: Vec::new(),
         };
 
-        let mut predictors: HashMap<u32, Box<dyn ProbabilityPredictor>> = HashMap::new();
+        let baseline = self.decode_baseline()?;
 
         for block_idx in 0..block_count {
             // Read block header
@@ -293,24 +293,11 @@ impl Decompressor {
                 }
             };
 
-            // Q7 security fix: limit predictor creation in verify path too
-            if !predictors.contains_key(&block_header.solid_group_id)
-                && predictors.len() >= MAX_SOLID_GROUP_COUNT as usize
-            {
-                result.corrupted_blocks.push(block_header.block_id);
-                break;
-            }
-            predictors
-                .entry(block_header.solid_group_id)
-                .or_insert_with(|| (self.predictor_factory)());
-            let predictor = predictors.get_mut(&block_header.solid_group_id).unwrap();
-
-            match router::decompress_chunk(
+            match router::decompress_chunk_with_baseline(
                 &payload,
                 block_header.compression_method,
                 block_header.uncompressed_size as usize,
-                predictor.as_mut(),
-                !block_header.predictor_state_flag,
+                baseline.as_deref(),
             ) {
                 Ok(data) => {
                     let computed_hash = blake3::hash(&data);
@@ -331,13 +318,13 @@ impl Decompressor {
         Ok(result)
     }
 
-    /// Decompress one block from a sequential stream, using per-group predictors.
+    /// Decompress one block from a sequential stream.
     ///
     /// Returns `(decompressed_data, block_id, compressed_size)`.
     fn decompress_block_streaming<R: Read>(
         &self,
         archive: &mut R,
-        predictors: &mut HashMap<u32, Box<dyn ProbabilityPredictor>>,
+        dict_baseline: Option<&[u8]>,
         decrypt_key: &Option<super::decompress::DecryptKey>,
     ) -> Result<(Vec<u8>, u32, u32)> {
         let block_header = BlockHeader::read_from(archive)?;
@@ -368,29 +355,14 @@ impl Decompressor {
         // Decrypt if encrypted
         let payload = maybe_decrypt_payload(payload, decrypt_key, block_header.block_id)?;
 
-        // Q7 security fix: limit predictor creation to prevent unbounded HashMap
-        // growth from crafted archives with unique solid_group_id per block.
-        if !predictors.contains_key(&block_header.solid_group_id)
-            && predictors.len() >= MAX_SOLID_GROUP_COUNT as usize
-        {
-            return Err(AetherError::ResourceLimitExceeded(format!(
-                "Too many distinct solid groups encountered in blocks (>{MAX_SOLID_GROUP_COUNT})",
-            )));
-        }
-        predictors
-            .entry(block_header.solid_group_id)
-            .or_insert_with(|| {
-                self.create_predictor()
-                    .unwrap_or_else(|_| (self.predictor_factory)())
-            });
-        let predictor = predictors.get_mut(&block_header.solid_group_id).unwrap();
-
-        let decompressed = router::decompress_chunk(
+        // The Q7 cap on distinct solid groups is gone with the predictor map it
+        // guarded: nothing is now allocated per solid_group_id, so a crafted
+        // archive with a unique group per block costs no memory.
+        let decompressed = router::decompress_chunk_with_baseline(
             &payload,
             block_header.compression_method,
             block_header.uncompressed_size as usize,
-            predictor.as_mut(),
-            !block_header.predictor_state_flag,
+            dict_baseline,
         )
         .map_err(|e| {
             AetherError::Decompression(format!(
