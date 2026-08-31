@@ -119,6 +119,23 @@ fn bwt_encode(data: &[u8]) -> std::result::Result<(Vec<u8>, u32), &'static str> 
 
 /// Inverse BWT using LF-mapping.
 fn bwt_decode(bwt: &[u8], primary_index: u32) -> std::result::Result<Vec<u8>, &'static str> {
+    bwt_decode_with(bwt, primary_index, TWO_CHAIN_MIN, MAX_PACKED_LF)
+}
+
+/// Largest block for which `(lf << 8) | byte` fits in a `u32`.
+const MAX_PACKED_LF: usize = 1 << 24;
+/// Above this, the packed table no longer fits comfortably in cache and the
+/// two-chain walk's extra table pays for itself.
+const TWO_CHAIN_MIN: usize = 1 << 20;
+
+/// [`bwt_decode`] with the size thresholds injected, so tests can drive every
+/// walk shape without allocating megabytes.
+fn bwt_decode_with(
+    bwt: &[u8],
+    primary_index: u32,
+    two_chain_min: usize,
+    max_packed_lf: usize,
+) -> std::result::Result<Vec<u8>, &'static str> {
     let n = bwt.len();
     if n == 0 {
         return Ok(vec![]);
@@ -141,29 +158,98 @@ fn bwt_decode(bwt: &[u8], primary_index: u32) -> std::result::Result<Vec<u8>, &'
         sum += count[i];
     }
 
-    // Build LF-mapping: LF[i] = C[bwt[i]] + rank of bwt[i] among equal chars before i
-    let mut lf = vec![0u32; n];
+    // ── Reconstruct the original by walking the LF-mapping backwards ──
+    //
+    // This walk is the whole cost of an inverse BWT: the index jumps
+    // essentially at random through an n-element table, missing cache on
+    // almost every output byte, and each jump depends on the previous one so
+    // the CPU cannot run ahead. Three shapes, chosen by size:
+    //
+    // 1. **Packed single chain** (default). The naive walk reads `bwt[idx]`
+    //    and `lf[idx]` — two arrays, two cache lines per byte. Packing them
+    //    into one `u32` as `(lf << 8) | byte` halves the misses. Needs
+    //    `lf < 2^24`, which `MAX_BWT_INPUT_SIZE` (8 MiB) guarantees for any
+    //    block a compressor produced.
+    //
+    // 2. **Two chains** (large blocks). Once the table no longer fits in
+    //    cache, the walk is pure memory latency with one miss outstanding at
+    //    a time. `LF` has a matching inverse `Q` (`Q[LF[i]] = i`), and
+    //    because the permutation is a single n-cycle, `Q` walked from
+    //    `primary_index` emits the output *forwards* exactly as `LF` emits it
+    //    backwards. Running both halves at once puts two independent misses
+    //    in flight. It costs a second table, which is why it is not used for
+    //    small blocks where everything already fits in cache — measured
+    //    1.6x at 2 MiB, but slower than shape 1 at 64 KiB.
+    //
+    // 3. **Two arrays** (beyond 2^24 bytes). Cannot pack; no real archive
+    //    reaches this, but a crafted header can claim it.
+    //
+    // Bounds: `lf[i] = cumul[c] + occ[c]` with `occ[c] < count[c]`, so
+    // `lf[i] < cumul[c] + count[c] = cumul[c + 1] <= n`. Every LF value is in
+    // range by construction — computed here, never read from the archive —
+    // so the walk needs no per-byte bounds check. Only `primary_index` comes
+    // from untrusted input, and it was validated above.
+
+    let mut output = vec![0u8; n];
+
+    if n > max_packed_lf {
+        let mut lf = vec![0u32; n];
+        let mut occ = [0u32; 256];
+        for (i, &b) in bwt.iter().enumerate() {
+            let c = b as usize;
+            lf[i] = cumul[c] + occ[c];
+            occ[c] += 1;
+        }
+
+        let mut idx = primary_index as usize;
+        for slot in output.iter_mut().rev() {
+            *slot = bwt[idx];
+            idx = lf[idx] as usize;
+        }
+        return Ok(output);
+    }
+
+    // forward[i] = (LF[i] << 8) | bwt[i]
+    let mut forward = vec![0u32; n];
     let mut occ = [0u32; 256];
-    for i in 0..n {
-        let c = bwt[i] as usize;
-        lf[i] = cumul[c] + occ[c];
+    for (i, &b) in bwt.iter().enumerate() {
+        let c = b as usize;
+        forward[i] = ((cumul[c] + occ[c]) << 8) | c as u32;
         occ[c] += 1;
     }
 
-    // Reconstruct original string by following LF-mapping backwards
-    let mut output = vec![0u8; n];
-    let mut idx = primary_index as usize;
-    for i in (0..n).rev() {
-        if idx >= n {
-            return Err("BWT LF-mapping out of bounds");
+    if n <= two_chain_min {
+        let mut idx = primary_index as usize;
+        for slot in output.iter_mut().rev() {
+            let packed = forward[idx];
+            *slot = packed as u8;
+            idx = (packed >> 8) as usize;
         }
-        output[i] = bwt[idx];
-        // L1 defense-in-depth: validate LF result before next iteration
-        let next_idx = lf[idx] as usize;
-        if next_idx >= n && i > 0 {
-            return Err("BWT LF-mapping produced out-of-bounds index");
-        }
-        idx = next_idx;
+        return Ok(output);
+    }
+
+    // inverse[LF[i]] = (i << 8) | bwt[i], so walking `inverse` from
+    // `primary_index` yields output[0], output[1], ... in order.
+    let mut inverse = vec![0u32; n];
+    for (i, &packed) in forward.iter().enumerate() {
+        inverse[(packed >> 8) as usize] = ((i as u32) << 8) | (packed & 0xFF);
+    }
+
+    let half = n / 2;
+    let mut back = primary_index as usize; // emits output[n-1] downwards
+    let mut fwd = primary_index as usize; // emits output[0] upwards
+    for k in 0..half {
+        let b = forward[back];
+        output[n - 1 - k] = b as u8;
+        back = (b >> 8) as usize;
+
+        let f = inverse[fwd];
+        output[k] = f as u8;
+        fwd = (f >> 8) as usize;
+    }
+    if n % 2 == 1 {
+        // Odd length leaves the middle byte to whichever chain is next.
+        output[half] = forward[back] as u8;
     }
 
     Ok(output)
@@ -218,10 +304,11 @@ fn mtf_decode(data: &[u8]) -> Vec<u8> {
         let byte = list[rank as usize];
         output.push(byte);
         if rank > 0 {
+            // `copy_within` is a memmove: one call instead of `rank`
+            // dependent loads and stores. Ranks are small after BWT, so this
+            // is short, but it is on every non-zero symbol.
             let r = rank as usize;
-            for i in (1..=r).rev() {
-                list[i] = list[i - 1];
-            }
+            list.copy_within(0..r, 1);
             list[0] = byte;
         }
     }
@@ -424,6 +511,56 @@ pub fn bwt_mtf_decode_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inverse BWT picks one of three walk shapes by block size. All
+    /// three must produce the same bytes; only the memory access pattern
+    /// differs. Thresholds are injected so this stays a fast test.
+    #[test]
+    fn every_inverse_bwt_walk_shape_agrees() {
+        let mut inputs: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            b"ab".to_vec(),
+            b"banana".to_vec(),       // odd length
+            b"abracadabra!".to_vec(), // even length
+            vec![7u8; 1000],          // single repeated symbol
+        ];
+        // Pseudo-random and text-like bodies at both parities.
+        for len in [999usize, 1000, 4095, 4096] {
+            let mut v = Vec::with_capacity(len);
+            let mut x: u32 = 0x1234_5678 ^ len as u32;
+            while v.len() < len {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                v.push((x >> 24) as u8);
+            }
+            inputs.push(v);
+
+            let words = ["the ", "quick ", "brown ", "fox ", "jumps "];
+            let mut t = String::new();
+            let mut i = 0;
+            while t.len() < len {
+                t.push_str(words[i % words.len()]);
+                i += 1;
+            }
+            t.truncate(len);
+            inputs.push(t.into_bytes());
+        }
+
+        for data in inputs {
+            let (bwt, primary) = bwt_encode(&data).unwrap();
+            let n = bwt.len();
+
+            // Shape 1: packed single chain.
+            let packed = bwt_decode_with(&bwt, primary, n, 1 << 24).unwrap();
+            // Shape 2: two chains (threshold below the input length).
+            let two_chain = bwt_decode_with(&bwt, primary, 0, 1 << 24).unwrap();
+            // Shape 3: unpacked two arrays (packing disabled).
+            let two_array = bwt_decode_with(&bwt, primary, 0, 0).unwrap();
+
+            assert_eq!(packed, data, "packed walk mismatch (n = {n})");
+            assert_eq!(two_chain, data, "two-chain walk mismatch (n = {n})");
+            assert_eq!(two_array, data, "two-array walk mismatch (n = {n})");
+        }
+    }
 
     #[test]
     fn bwt_roundtrip_simple() {
