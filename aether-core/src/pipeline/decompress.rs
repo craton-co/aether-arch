@@ -404,19 +404,17 @@ impl VerificationResult {
 
 // ── Shared helpers (used by both seekable and streaming paths) ──────────────
 
-/// Reassemble a file from decompressed blocks by concatenating the file's
-/// block range and truncating to the original file size.
-pub(crate) fn reassemble_file_from_blocks(
+/// The half-open block range a file occupies, validated against the block
+/// array's length.
+fn file_block_range(
     file_entry: &FileEntry,
-    decompressed_blocks: &[Option<Vec<u8>>],
-) -> Result<Vec<u8>> {
+    block_count: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
     let start = file_entry.chunk_start_idx as usize;
     let count = file_entry.chunk_count as usize;
-
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-
     // M4 security fix: use checked addition to prevent integer overflow on the
     // chunk range (start + count) which comes from untrusted archive data.
     let end = start.checked_add(count).ok_or_else(|| {
@@ -424,23 +422,83 @@ pub(crate) fn reassemble_file_from_blocks(
             "Chunk index overflow: start={start}, count={count}"
         ))
     })?;
+    if end > block_count {
+        // Report the first index that would be out of range, matching what a
+        // per-index scan would have said.
+        return Err(AetherError::BlockNotFound(start.max(block_count) as u32));
+    }
+    Ok(Some(start..end))
+}
+
+/// Truncate to the exact file size — the last chunk may run past the file
+/// boundary — in place rather than by copying the prefix out.
+fn truncate_to_file_size(file_entry: &FileEntry, mut combined: Vec<u8>) -> Vec<u8> {
+    combined.truncate(file_entry.original_size as usize);
+    combined
+}
+
+/// Reassemble a file from decompressed blocks, leaving the blocks in place.
+///
+/// Used where the same block array is read more than once (verification
+/// re-reads it per file), so it cannot consume the blocks.
+pub(crate) fn reassemble_file_from_blocks(
+    file_entry: &FileEntry,
+    decompressed_blocks: &[Option<Vec<u8>>],
+) -> Result<Vec<u8>> {
+    let Some(range) = file_block_range(file_entry, decompressed_blocks.len())? else {
+        return Ok(Vec::new());
+    };
+
     // S3 security fix: cap allocation hint to prevent OOM from crafted
     // archives with inflated original_size in untrusted metadata.
     let capacity = (file_entry.original_size as usize).min(MAX_TOTAL_DECOMPRESSED_SIZE as usize);
     let mut combined = Vec::with_capacity(capacity);
-    for i in start..end {
-        if i >= decompressed_blocks.len() {
-            return Err(AetherError::BlockNotFound(i as u32));
-        }
+    for i in range {
         match &decompressed_blocks[i] {
             Some(data) => combined.extend_from_slice(data),
             None => return Err(AetherError::BlockNotFound(i as u32)),
         }
     }
 
-    // Truncate to exact file size (last chunk may extend past file boundary)
-    let end = (file_entry.original_size as usize).min(combined.len());
-    Ok(combined[..end].to_vec())
+    Ok(truncate_to_file_size(file_entry, combined))
+}
+
+/// Reassemble a file, taking its blocks out of the array as it goes.
+///
+/// Extraction reads each block exactly once — a block belongs to exactly one
+/// file — so the decompressed bytes can be released as the file is built
+/// instead of being held until the whole archive has been written. For a
+/// single-block file this also hands the block's buffer straight through
+/// with no copy at all, which is the common case for small files.
+pub(crate) fn reassemble_file_consuming(
+    file_entry: &FileEntry,
+    decompressed_blocks: &mut [Option<Vec<u8>>],
+) -> Result<Vec<u8>> {
+    let Some(range) = file_block_range(file_entry, decompressed_blocks.len())? else {
+        return Ok(Vec::new());
+    };
+
+    let mut take = |i: usize| -> Result<Vec<u8>> {
+        decompressed_blocks[i]
+            .take()
+            .ok_or(AetherError::BlockNotFound(i as u32))
+    };
+
+    let start = range.start;
+    let mut combined = take(start)?;
+    if range.len() > 1 {
+        // S3 security fix: cap the reservation hint so an inflated
+        // original_size in untrusted metadata cannot force a huge allocation.
+        let capacity =
+            (file_entry.original_size as usize).min(MAX_TOTAL_DECOMPRESSED_SIZE as usize);
+        combined.reserve(capacity.saturating_sub(combined.len()));
+        for i in (start + 1)..range.end {
+            let block = take(i)?;
+            combined.extend_from_slice(&block);
+        }
+    }
+
+    Ok(truncate_to_file_size(file_entry, combined))
 }
 
 /// Validate that a file path from an archive is safe to extract.

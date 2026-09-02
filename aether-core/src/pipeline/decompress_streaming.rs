@@ -13,7 +13,7 @@ use crate::header::{ArchiveHeader, FileEntry, SolidGroupEntry};
 use crate::pipeline::router;
 
 use super::decompress::{
-    derive_decrypt_key, hex_str, maybe_decrypt_payload, reassemble_file_from_blocks,
+    derive_decrypt_key, hex_str, maybe_decrypt_payload, reassemble_file_consuming,
     write_validated_file, Decompressor, StreamingMetadata, VerificationResult,
 };
 
@@ -175,7 +175,7 @@ impl Decompressor {
 
         // Reassemble and write files
         for file_entry in &metadata.file_entries {
-            let file_data = reassemble_file_from_blocks(file_entry, &decompressed_blocks)?;
+            let file_data = reassemble_file_consuming(file_entry, &mut decompressed_blocks)?;
 
             // Verify file-level BLAKE3 hash
             let computed_hash = blake3::hash(&file_data);

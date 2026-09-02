@@ -13,8 +13,9 @@ use crate::header::{ArchiveFooter, FileEntry, SolidGroupEntry};
 use crate::pipeline::router;
 
 use super::decompress::{
-    derive_decrypt_key, hex_str, maybe_decrypt_payload, reassemble_file_from_blocks,
-    write_validated_file, ArchiveMetadata, Decompressor, VerificationResult,
+    derive_decrypt_key, hex_str, maybe_decrypt_payload, reassemble_file_consuming,
+    reassemble_file_from_blocks, write_validated_file, ArchiveMetadata, Decompressor,
+    VerificationResult,
 };
 
 #[cfg(feature = "enterprise")]
@@ -367,9 +368,10 @@ impl Decompressor {
         let decompressed_blocks =
             self.decompress_blocks_sequential(archive, &metadata, &decrypt_key)?;
 
-        // Reassemble files
+        // Reassemble files, releasing each block as it is consumed.
+        let mut decompressed_blocks = decompressed_blocks;
         for file_entry in &metadata.file_entries {
-            let file_data = reassemble_file_from_blocks(file_entry, &decompressed_blocks)?;
+            let file_data = reassemble_file_consuming(file_entry, &mut decompressed_blocks)?;
 
             // Verify BLAKE3 hash
             let computed_hash = blake3::hash(&file_data);
@@ -470,7 +472,7 @@ impl Decompressor {
             chunk_start_idx: 0,
             ..file_entry.clone()
         };
-        let file_data = reassemble_file_from_blocks(&adjusted_entry, &decompressed_blocks)?;
+        let file_data = reassemble_file_consuming(&adjusted_entry, &mut decompressed_blocks)?;
 
         // Verify
         let computed_hash = blake3::hash(&file_data);
