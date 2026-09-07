@@ -2,6 +2,61 @@
 
 Production readiness, licensing, and monetization plan for AetherArch 0.3.0+.
 
+## Phase 8: Decompression speed (post-0.3.0) — COMPLETE
+
+Full analysis, per-stage measurements and the rejected alternatives are in
+[`docs/perf/decompression.md`](perf/decompression.md).
+
+### Correctness gates (a path that cannot decode has no throughput)
+
+- [x] Fixed `Order0Model::query_cdf` failing to reproduce `predict_cdf`'s
+  whole-table overshoot fallback — it made byte-plane blocks written by 0.3.0
+  unreadable.
+- [x] Fixed `PredictorRans` / `Lz77PredictorRans` decoding with the group
+  predictor when the encoder had always used a scratch NeuralSSM, which made
+  those blocks undecodable under any non-NeuralSSM predictor.
+- [x] Added routed round-trip coverage across text, numeric, executable-like
+  and incompressible data for every group predictor the CLI offers.
+
+### Decode hot loop
+
+- [x] Removed the per-output-byte predictor sync pass from both sides.
+- [x] Added `ProbabilityPredictor::decode_symbol`, the decode-side
+  counterpart to `query_cdf`, and a NeuralSSM implementation that searches
+  ~9 quantised boundaries instead of materialising 257.
+- [x] Removed the per-symbol `[f32; 256]` build-and-copy of the RLE baseline.
+- [x] Replaced Order0's per-symbol hardware divides with an exact
+  multiply-and-shift.
+- [x] Measured and rejected an Order0 `decode_symbol` override.
+
+### Scaling, memory and I/O
+
+- [x] Parallel decompression moved from `enterprise` to `threading`, split per
+  block rather than per solid group, and enabled by default in `aether-cli`.
+- [x] Removed predictor construction from the decode path entirely by passing
+  the dictionary coding baseline directly.
+- [x] Two-chain inverse BWT above 1 MiB; packed LF table below.
+- [x] Extraction releases blocks as it consumes them and no longer copies each
+  reassembled file twice.
+- [x] Buffered archive reads; `aet extract` reports decompressed throughput.
+
+### Deliberately not done
+
+- [ ] Bounded-memory extraction: `extract_all` still decodes every block
+  before writing any file, so peak memory tracks the uncompressed archive.
+  Interleaving decode and write per file is the fix; the block index already
+  supports it.
+- [ ] An overshoot-free quantiser for `Order0Model` (as NeuralSSM already
+  has). Removes both the fallback cost and the class of bug the `query_cdf`
+  desync belonged to, but changes every Order0 bitstream — a format-break
+  change.
+- [ ] Chunking policy for parallelism: FastCDC produced a single 2 MiB chunk
+  for a 2 MiB English text file, and decode parallelism is bounded by block
+  count. Changing it has ratio consequences and belongs to the compression
+  side.
+
+---
+
 ## Phase 7: Research proposal retirement (0.3.0) — COMPLETE
 
 - [x] Centralized the 7.0 bps BWT entropy threshold.

@@ -2,7 +2,7 @@
 
 **Project**: AetherArch (.aet) — next-generation file archiver in Rust  
 **Version**: 0.3.0
-**Status**: 285 tests (128 unit + 87 integration + 28 FFI + 41 server + 1 doc, 5 ignored)  
+**Status**: 330 tests (164 unit + 96 integration + 28 FFI + 41 server + 1 doc, 7 ignored)  
 **Workspace**: `aether-core`, `aether-cli` (`aet`), `aether-ffi`, `aether-server`, `aether-wasm`
 
 ---
@@ -13,7 +13,7 @@
 - **Language**: Rust 1.70+
 - **Build**: Cargo workspace (5 crates)
 - **Testing**: cargo test (unit, integration, FFI)
-- **Benchmarking**: Criterion (cargo bench -p aether-core)
+- **Benchmarking**: Criterion (`benches/compression.rs`, `benches/decompression.rs`)
 - **Code Quality**: clippy, rustfmt
 - **CI/CD**: GitHub Actions (.github/workflows/)
 
@@ -23,10 +23,12 @@ cargo build              # Debug build
 cargo build --release   # Optimized release build
 cargo test              # Run all tests (285 total)
 cargo test --release   # Faster test execution
-cargo bench -p aether-core  # Criterion benchmarks
+cargo bench -p aether-core  # Criterion benchmarks (compression + decompression)
+cargo bench -p aether-core --bench decompression  # decode path only
 cargo clippy -- -D warnings # Linting (must pass)
 cargo fmt --check       # Format validation
 aet bench --compare     # Compare vs gzip/bzip2/xz/zstd
+pwsh ./scripts/decompression-matrix.ps1 -Binary ... -DatasetRoot ...  # read-path matrix
 ```
 
 ### Directory Organization
@@ -73,10 +75,18 @@ aether-wasm/src/lib.rs       # WebAssembly bindings (decompress-only)
 - Why: Entropy-based adaptive routing picks smallest compressed form
 - Update when: Adding new compression methods (update router.rs and format.rs)
 
-**[DECISION] Predictor Syncing**
-- `predictor_synced` flag in BlockHeader avoids redundant sync after BWT decisive wins
-- Why: BWT clustering already optimizes context; re-syncing is O(n) waste
-- How to apply: Always set `predictor_synced` when BWT is chosen; check flag in decompress_chunk
+**[DECISION] Block Independence**
+- Every predictor-backed payload is coded by a scratch predictor that
+  `encode_block`/`decode_block` reset per block, so no cross-block group
+  predictor state is ever consumed
+- Why: it is what makes parallel compression, parallel decompression and
+  single-file random access all valid, and it removed a per-output-byte
+  predictor pass from the decode path
+- How to apply: decode through `router::decompress_chunk_with_baseline` and
+  pass the dictionary baseline, not a predictor. The `predictor_synced` /
+  `predictor_state_flag` fields are still written and read for format
+  stability but no path consumes them — do not reintroduce a sync pass
+  without a predictor that genuinely carries state across blocks
 
 **[DECISION] Per-Block Encryption**
 - Master nonce XOR block_id enables random-access decryption without reading sequentially
@@ -93,7 +103,14 @@ aether-wasm/src/lib.rs       # WebAssembly bindings (decompress-only)
 - **Internal (2.6 MiB)**: 2.75% ratio (0.220 bpb), 3.0 comp MB/s, 3.1 decomp MB/s
 - **Silesia (202 MiB)**: 26.45% ratio (2.116 bpb), 0.2 comp MB/s, 0.3 decomp MB/s
 - **Compression**: Prioritize ratio over speed; entropy coder ~1 MiB/s is acceptable
-- **Decompression**: Aim for 10+ MB/s on modern CPUs (parallel via rayon)
+- **Decompression**: entropy decoding is the whole cost — everything else put
+  together is under a tenth of it on the archival profile. Measure with
+  `cargo bench -p aether-core --bench decompression`, which isolates the
+  decode loop, each method, each inverse transform and the archive paths.
+  See `docs/perf/decompression.md`
+- **Benchmarking on a loaded machine**: wall-clock here varies 2-4x between
+  runs. Compare old and new code paths *inside one process* and take the
+  minimum of several repetitions; never compare across separate runs
 
 ### Quality Assurance
 
@@ -289,7 +306,7 @@ Example:
 | Crypto | chacha20poly1305, aes-gcm | AEAD ciphers |
 | KDF | argon2 | Password-based key derivation |
 | Hashing | blake3 | Dictionary verification |
-| Parallel | rayon | Multi-threaded decompression |
+| Parallel | rayon | Parallel compression (per chunk) and decompression (per block) |
 | Fuzzing | libfuzzer | Crash detection |
 | Benchmarking | criterion | Performance profiling |
 | WebAssembly | wasm-bindgen | JS FFI |

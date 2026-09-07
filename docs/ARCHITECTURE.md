@@ -541,14 +541,33 @@ Step 5: Store (uncompressed)
 
 The BWT path uses its own internal `NeuralSsmPredictor` regardless of which predictor the user selected via CLI, because the NeuralSSM is specifically designed for the RUNA/RUNB stream that BWT+MTF+RLE produces.
 
-### Predictor Sync
+### Block Independence
 
-Predictor-coded blocks reset at block boundaries. Under the `threading` feature,
-chunks within a solid group therefore use independent predictors and are
-compressed in parallel; ordered collection preserves deterministic block
-layout. Dictionary baselines are installed on every per-chunk predictor.
+Every predictor-backed payload — BWT, LZ77, plain and byte-plane — is
+range-coded by a **scratch predictor the router owns**, not by the caller's
+group predictor, and both `encode_block` and `decode_block` reset it before
+the first symbol. A block's coding therefore depends only on that block's
+bytes and, if a dictionary is configured, the coding baseline.
 
-**Sync skip**: When BWT wins decisively (`bwt_decisive`), the sync step is omitted. Subsequent chunks of the same content type will also use BWT (with its own internal predictor), so the group predictor's cross-block state will not be consumed by any LZ77 or plain-RC path block. This avoids an O(n) per-byte predict+update pass through the group predictor for each chunk — a significant saving for expensive predictors like NeuralSsm or ContextMixer.
+Three things rest on this:
+
+- **Parallel compression.** Under `threading`, chunks within a solid group use
+  independent predictors and compress in parallel; ordered collection
+  preserves deterministic block layout.
+- **Parallel decompression.** Under `threading`, the seekable path decodes one
+  rayon task per block. Blocks are not tied to their solid group, which
+  matters because block sizes within an archive span two orders of magnitude
+  and a group-per-task split leaves workers idle.
+- **Random access.** `extract_file` decodes only the blocks its file occupies.
+
+Earlier revisions nonetheless ran a full `predict`/`update` pass over every
+chunk's plaintext on both sides ("sync_predictor") to keep that unread group
+state symmetric. On the decode side that cost one predictor step per *output*
+byte — for `Zstd`, `Store` and `BcjZstd` blocks it was the entire cost of
+decompression. It is gone. `CompressedChunk::predictor_synced` and the block
+header's `predictor_state_flag` are still written and read, so the format is
+unchanged and a predictor with genuine cross-block state could reintroduce the
+pass without a format break.
 
 ### When Routing Skips PredictorRans
 

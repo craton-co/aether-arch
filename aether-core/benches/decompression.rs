@@ -266,16 +266,32 @@ fn bench_transforms(c: &mut Criterion) {
     let mut group = c.benchmark_group("transform");
     group.sample_size(20);
 
-    // Inverse BWT + MTF
+    // Inverse BWT + MTF, at sizes straddling the point where the LF table
+    // stops fitting in cache. The walk changes shape there — a single size
+    // would measure only half of it.
+    for &size in &[128 * 1024usize, 512 * 1024, 2 * 1024 * 1024] {
+        let sample = text_sample(size);
+        if sample.len() < size {
+            continue; // fixture too small for this case
+        }
+        let (primary_index, mtf) =
+            bwt_preprocess::bwt_mtf_encode_parts(&sample).expect("bwt encode");
+        group.throughput(Throughput::Bytes(sample.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("bwt_mtf_decode", format!("{}KiB", size / 1024)),
+            &(primary_index, mtf, sample.len()),
+            |b, (primary_index, mtf, len)| {
+                b.iter(|| {
+                    let out =
+                        bwt_preprocess::bwt_mtf_decode_parts(*primary_index, mtf, *len).unwrap();
+                    black_box(out.len());
+                });
+            },
+        );
+    }
+
     let (primary_index, mtf) = bwt_preprocess::bwt_mtf_encode_parts(&text).expect("bwt encode");
-    group.throughput(Throughput::Bytes(text.len() as u64));
-    group.bench_function("bwt_mtf_decode", |b| {
-        b.iter(|| {
-            let out =
-                bwt_preprocess::bwt_mtf_decode_parts(primary_index, &mtf, text.len()).unwrap();
-            black_box(out.len());
-        });
-    });
+    let _ = primary_index;
 
     // RLE decode over the same MTF stream
     if let Some(rle) = bwt_preprocess::rle_encode(&mtf) {

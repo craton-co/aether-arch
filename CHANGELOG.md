@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Archives written by 0.3.0 could be unextractable.** `Order0Model`'s
+  encode-side `query_cdf` fast path did not reproduce `predict_cdf`'s
+  whole-table overshoot fallback, so encoder and decoder disagreed on skewed
+  distributions — including the float-exponent planes every byte-plane block
+  range-codes. Affected blocks fail with "range decoder read N bytes past end
+  of input". The encoder is fixed; **bytes already written cannot be
+  repaired**, so re-create any 0.3.0 archive containing numeric or
+  binary-structured data and verify it with `aet verify`.
+- **`PredictorRans` and `Lz77PredictorRans` blocks failed to decode under any
+  non-NeuralSSM predictor**, including `cm`, the CLI's default for
+  compression. `compress_chunk` has always range-coded those payloads with a
+  scratch `NeuralSsmPredictor`; `decompress_chunk` used the group predictor.
+  The decoder now builds the same predictor, so every archive ever written
+  stays readable.
+
+### Changed
+
+- **Decompression is substantially faster.** The read path no longer runs a
+  full predictor pass over data it has already decoded — for an
+  incompressible 256 KiB block that pass alone was 423 ms, against 40 us for
+  the whole block now; the range decoder and
+  the predictor are fused so a symbol is resolved from ~9 quantised
+  boundaries instead of a materialised 257-entry table; and the NeuralSSM
+  literal baseline is consumed without building and copying a `[f32; 256]`
+  per byte. Whole-archive extraction and `aet verify` measure **2.6-3.0x**
+  faster single-threaded against 0.3.0, before any thread scaling. Details,
+  per-stage measurements and the rejected alternatives are in
+  [`docs/perf/decompression.md`](docs/perf/decompression.md).
+- **Parallel decompression moved from the `enterprise` feature to
+  `threading`, and `aether-cli` enables `threading` by default.** Released
+  binaries now use the machine they run on for both compression and
+  decompression. Work is split per block rather than per solid group, so it
+  scales on archives whose groups are unevenly sized. Output is byte-identical
+  at every thread count.
+- `aet extract --threads` is now optional and defaults to half the available
+  cores, matching `Compressor`. `0` still means all cores, `1` sequential.
+- `aet extract` reports throughput over the bytes it produced rather than the
+  bytes it read.
+- Inverse BWT walks a packed LF table, and above 1 MiB walks `LF` and its
+  inverse concurrently to keep two cache misses in flight (~1.6x at 2 MiB).
+- `Order0Model` builds its CDF with an exact multiply-and-shift instead of up
+  to 256 hardware divides (2.25x on CDF construction).
+- Extraction releases each decompressed block as it is consumed, and no longer
+  copies every reassembled file a second time.
+- The CLI reads archives through a `BufReader`; the metadata tables were being
+  read one small struct at a time.
+
+### Added
+
+- `benches/decompression.rs`: Criterion benchmarks isolating the decode loop,
+  each compression method, each inverse transform, and the whole-archive
+  paths.
+- `scripts/decompression-matrix.ps1`: decompression counterpart to the
+  compression matrix — untimed compression setup, repeated extraction reported
+  as minimum and median, a thread-count sweep, and `verify` and single-file
+  extraction measured alongside full extraction.
+- `ProbabilityPredictor::decode_symbol` (decode-side counterpart to
+  `query_cdf`) and `router::decompress_chunk_with_baseline`. Both are
+  additive; existing implementations and callers are unaffected.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added

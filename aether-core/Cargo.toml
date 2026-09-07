@@ -56,9 +56,12 @@ context-mixer = []
 ## Disable to eliminate the lz4_flex dependency entirely.
 lz4 = ["dep:lz4_flex"]
 cloud = []
+## Parallel compression (chunks within a solid group) and parallel
+## decompression (one task per block). Output is byte-identical to a
+## single-threaded build at every thread count.
 threading = ["dep:rayon"]
 ## Enterprise features (commercial license required for proprietary use).
-## Enables encryption (AES-256-GCM, ChaCha20-Poly1305), multi-threaded decompression, and cloud storage.
+## Enables encryption (AES-256-GCM, ChaCha20-Poly1305) and cloud storage.
 enterprise = ["dep:aes-gcm", "dep:chacha20poly1305", "dep:argon2", "dep:zeroize", "dep:subtle", "dep:getrandom_crate", "cloud", "threading"]
 ## Placeholder for future Candle-based neural model inference
 neural-candle = []
