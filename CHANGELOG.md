@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copies every reassembled file a second time.
 - The CLI reads archives through a `BufReader`; the metadata tables were being
   read one small struct at a time.
+- `aet verify` decodes blocks in parallel too, recording per-block failures
+  rather than stopping at the first (3.16x on a 57-file source tree, 2.67x on
+  a float corpus).
+- Byte-plane blocks decode their planes concurrently under `threading` — the
+  planes are independent Order0 streams and that decode is most of the method
+  (2.6x on a 512 KiB float array).
 
 ### Added
 

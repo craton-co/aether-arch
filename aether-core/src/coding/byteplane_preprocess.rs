@@ -378,23 +378,32 @@ pub fn byteplane_decode(payload: &[u8], uncompressed_size: usize) -> crate::erro
         )));
     }
 
-    // Decode each plane
-    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(w);
+    // Slice the payload into per-plane views up front, so the decode below is
+    // a pure function of (view, flags) with no shared cursor.
+    let mut plane_views: Vec<(usize, &[u8])> = Vec::with_capacity(w);
     let mut data_offset = sizes_end;
     for (i, &psize) in plane_sizes.iter().enumerate() {
-        let plane_data = &payload[data_offset..data_offset + psize];
+        plane_views.push((i, &payload[data_offset..data_offset + psize]));
         data_offset += psize;
+    }
 
+    // Decode one plane. Each plane is range-coded with its own fresh Order0
+    // model, so planes share no state — decoding them concurrently is
+    // exactly equivalent to decoding them in order.
+    let decode_plane = |(i, plane_data): &(usize, &[u8])| -> crate::error::Result<Vec<u8>> {
+        let i = *i;
         let mut plane = if (rc_flags >> i) & 1 == 1 {
             // RC-compressed: decode with Order0
             let mut predictor = Order0Model::new();
             rans::decode_block(plane_data, n_elements, &mut predictor)?
         } else {
             // Stored raw
-            if psize != n_elements {
+            if plane_data.len() != n_elements {
                 return Err(AetherError::Decompression(format!(
                     "BytePlane raw plane {} size mismatch: {} vs expected {}",
-                    i, psize, n_elements,
+                    i,
+                    plane_data.len(),
+                    n_elements,
                 )));
             }
             plane_data.to_vec()
@@ -405,8 +414,25 @@ pub fn byteplane_decode(payload: &[u8], uncompressed_size: usize) -> crate::erro
             delta_decode(&mut plane);
         }
 
-        planes.push(plane);
-    }
+        Ok(plane)
+    };
+
+    // A 4-byte element width means four independent Order0 streams, and that
+    // decode is by far the most expensive part of a byte-plane block — the
+    // planes are the only parallelism this method has.
+    #[cfg(feature = "threading")]
+    let planes: Vec<Vec<u8>> = {
+        use rayon::prelude::*;
+        plane_views
+            .par_iter()
+            .map(decode_plane)
+            .collect::<crate::error::Result<Vec<_>>>()?
+    };
+    #[cfg(not(feature = "threading"))]
+    let planes: Vec<Vec<u8>> = plane_views
+        .iter()
+        .map(decode_plane)
+        .collect::<crate::error::Result<Vec<_>>>()?;
 
     // Read tail bytes
     let tail = &payload[data_offset..data_offset + tail_len];

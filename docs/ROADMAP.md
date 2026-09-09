@@ -39,6 +39,9 @@ Full analysis, per-stage measurements and the rejected alternatives are in
 - [x] Extraction releases blocks as it consumes them and no longer copies each
   reassembled file twice.
 - [x] Buffered archive reads; `aet extract` reports decompressed throughput.
+- [x] `aet verify` decodes in parallel while still reporting per-block
+  corruption rather than stopping at the first bad block.
+- [x] Byte-plane blocks decode their independent Order0 planes concurrently.
 
 ### Deliberately not done
 

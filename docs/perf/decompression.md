@@ -53,6 +53,7 @@ comparable within a run.
 | Inverse BWT + MTF, 128 KiB | 33 MiB/s | |
 | Inverse BWT + MTF, 512 KiB | 25 MiB/s | |
 | Inverse BWT + MTF, 2 MiB | 12 MiB/s | ~25% of a 2 MiB BWT block |
+| Byte-plane decode, 512 KiB | 0.26 MiB/s sequential, 0.68 MiB/s over 4 planes | Order0 rANS per plane |
 | RLE decode | ~840 MiB/s | Negligible |
 | LZ77 decode | ~1.0 GiB/s | Negligible |
 | Zstd decode | ~380 MiB/s | Negligible |
@@ -229,7 +230,26 @@ on the last, so the CPU cannot run ahead. Two changes, picked by block size:
 | 512 KiB | 24 MiB/s | 27 MiB/s | 31 MiB/s |
 | 2048 KiB | 10 MiB/s | 11 MiB/s | 16 MiB/s |
 
-### 8. Reassembly and I/O
+### 8. Parallelise the two things left holding a whole core
+
+**Byte-plane planes.** A byte-plane block is two or four independent Order0
+streams, and that decode is by far the most expensive part of the method —
+the planes are the only parallelism it has. Decoding them concurrently under
+`threading` measures **2.6x** (1.99 s to 752 ms on a 512 KiB float array).
+Nested inside the per-block parallelism, rayon's work-stealing absorbs it.
+
+**Verification.** `verify` decodes every block, so it scales exactly like
+extraction — but it must not stop at the first failure, since finding bad
+blocks is the point and one corrupt block must not hide the state of
+everything after it. Both the read and the decode therefore record failures
+per block and continue. Measured through the CLI: a 57-file source tree goes
+2879 ms to 912 ms (**3.16x**), a 2 MiB float corpus 14.1 s to 5.3 s
+(**2.67x**).
+
+`verify_reports_the_same_corruption_at_every_thread_count` corrupts two block
+payloads and checks that every thread count reports exactly the same two.
+
+### 9. Reassembly and I/O
 
 * Extraction takes each block out of the array as it consumes it, instead of
   holding every decompressed block until the last file is written. A

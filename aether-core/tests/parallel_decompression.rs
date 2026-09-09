@@ -172,3 +172,76 @@ fn verify_reports_ok_under_every_thread_count() {
         assert_eq!(result.verified_blocks, result.total_blocks);
     }
 }
+
+/// Verification must report corruption, not fail, and must report the *same*
+/// corruption whatever the thread count.
+///
+/// Extraction stops at the first bad block; verification must not — finding
+/// bad blocks is its job, and one corrupt block must not hide the state of
+/// everything after it. The parallel path reads leniently for exactly this
+/// reason, so it needs its own coverage.
+#[test]
+fn verify_reports_the_same_corruption_at_every_thread_count() {
+    let files = corpus();
+    let (_keep, archive) = build_archive(&files, || Box::new(NeuralSsmPredictor::new()));
+
+    // Find the block payloads by their index entries, then flip bits inside
+    // two of them. Corrupting the payload (rather than a header) keeps the
+    // archive structurally walkable, so verification should reach every
+    // block and report precisely the two that were damaged.
+    let metadata = {
+        let decompressor = Decompressor::new(|| Box::new(NeuralSsmPredictor::new()));
+        let mut cursor = Cursor::new(&archive[..]);
+        decompressor
+            .read_metadata(&mut cursor)
+            .expect("read_metadata")
+    };
+    assert!(
+        metadata.block_index.len() >= 4,
+        "need several blocks to make this test meaningful",
+    );
+
+    let mut corrupted = archive.clone();
+    let targets = [1usize, metadata.block_index.len() - 1];
+    for &i in &targets {
+        let entry = &metadata.block_index[i];
+        // Land inside the compressed payload: past the block header, and
+        // short of the trailer.
+        let offset = entry.archive_offset as usize + 40;
+        assert!(offset < corrupted.len());
+        corrupted[offset] ^= 0xFF;
+        corrupted[offset + 1] ^= 0x0F;
+    }
+
+    let mut reports = Vec::new();
+    for threads in [1usize, 2, 4, 0] {
+        let decompressor =
+            Decompressor::new(|| Box::new(NeuralSsmPredictor::new())).with_max_threads(threads);
+        let mut cursor = Cursor::new(&corrupted[..]);
+        let result = decompressor.verify(&mut cursor).unwrap_or_else(|e| {
+            panic!("verify errored with {threads} thread(s) instead of reporting: {e}")
+        });
+
+        assert!(
+            !result.is_ok(),
+            "verify missed the corruption with {threads} thread(s)",
+        );
+        assert_eq!(result.total_blocks, metadata.block_index.len());
+
+        let mut corrupt = result.corrupted_blocks.clone();
+        corrupt.sort_unstable();
+        reports.push((threads, corrupt, result.verified_blocks));
+    }
+
+    let (_, reference_corrupt, reference_verified) = reports[0].clone();
+    for (threads, corrupt, verified) in &reports[1..] {
+        assert_eq!(
+            corrupt, &reference_corrupt,
+            "verify with {threads} thread(s) reported different corrupt blocks",
+        );
+        assert_eq!(
+            verified, &reference_verified,
+            "verify with {threads} thread(s) counted a different number of good blocks",
+        );
+    }
+}

@@ -524,8 +524,63 @@ impl Decompressor {
 
         let mut decompressed_blocks: Vec<Option<Vec<u8>>> = vec![None; metadata.block_index.len()];
 
-        for (i, block_entry) in metadata.block_index.iter().enumerate() {
-            match self.decompress_block(archive, block_entry, baseline.as_deref(), &decrypt_key) {
+        // Verification decodes every block, so it scales exactly like
+        // extraction does. Unlike extraction it must not stop at the first
+        // failure — a corrupt block is the thing being looked for — so both
+        // the read and the decode record failures per block and continue.
+        #[cfg(feature = "threading")]
+        let decoded: Vec<Result<Vec<u8>>> = if self.max_threads != 1
+            && metadata.block_index.len() > 1
+        {
+            use rayon::prelude::*;
+
+            let raw = self.read_raw_blocks_lenient(archive, &metadata, &decrypt_key);
+            let baseline = baseline.as_deref();
+            let decode_all = || -> Vec<Result<Vec<u8>>> {
+                raw.par_iter()
+                    .map(|block| match block {
+                        Ok(block) => decompress_raw_block(block, baseline),
+                        Err(e) => Err(AetherError::Decompression(e.clone())),
+                    })
+                    .collect()
+            };
+
+            if self.max_threads == 0 {
+                decode_all()
+            } else {
+                match rayon::ThreadPoolBuilder::new()
+                    .num_threads(self.max_threads)
+                    .build()
+                {
+                    Ok(pool) => pool.install(decode_all),
+                    Err(e) => {
+                        return Err(AetherError::Decompression(format!(
+                            "Failed to create verification thread pool with {} threads: {e}",
+                            self.max_threads,
+                        )))
+                    }
+                }
+            }
+        } else {
+            metadata
+                .block_index
+                .iter()
+                .map(|block_entry| {
+                    self.decompress_block(archive, block_entry, baseline.as_deref(), &decrypt_key)
+                })
+                .collect()
+        };
+        #[cfg(not(feature = "threading"))]
+        let decoded: Vec<Result<Vec<u8>>> = metadata
+            .block_index
+            .iter()
+            .map(|block_entry| {
+                self.decompress_block(archive, block_entry, baseline.as_deref(), &decrypt_key)
+            })
+            .collect();
+
+        for (i, (block_entry, outcome)) in metadata.block_index.iter().zip(decoded).enumerate() {
+            match outcome {
                 Ok(data) => {
                     decompressed_blocks[i] = Some(data);
                     result.verified_blocks += 1;
@@ -671,6 +726,70 @@ impl Decompressor {
         Ok(decompressed_blocks)
     }
 
+    /// Read every block's payload, recording per-block failures instead of
+    /// stopping at the first one.
+    ///
+    /// The fail-fast reader inside `decompress_blocks_parallel` is right for
+    /// extraction — a block that will not read means the extraction cannot
+    /// succeed. Verification is the opposite: finding those blocks is the
+    /// point, and a corrupt header must not hide the state of everything
+    /// after it. Reads are positioned from the block index, so one bad block
+    /// does not desynchronise the next.
+    ///
+    /// Errors are carried as strings because they are re-raised per block on
+    /// the other side of a rayon boundary.
+    #[cfg(feature = "threading")]
+    fn read_raw_blocks_lenient<R: Read + Seek>(
+        &self,
+        archive: &mut R,
+        metadata: &ArchiveMetadata,
+        decrypt_key: &Option<super::decompress::DecryptKey>,
+    ) -> Vec<std::result::Result<RawBlock, String>> {
+        let mut blocks = Vec::with_capacity(metadata.block_index.len());
+
+        for (i, block_entry) in metadata.block_index.iter().enumerate() {
+            blocks.push(
+                self.read_raw_block(archive, i, block_entry, decrypt_key)
+                    .map_err(|e| e.to_string()),
+            );
+        }
+
+        blocks
+    }
+
+    /// Read one block's header, payload and trailer, decrypting if needed.
+    #[cfg(feature = "threading")]
+    fn read_raw_block<R: Read + Seek>(
+        &self,
+        archive: &mut R,
+        global_idx: usize,
+        block_entry: &BlockIndexEntry,
+        decrypt_key: &Option<super::decompress::DecryptKey>,
+    ) -> Result<RawBlock> {
+        let offset = block_entry.archive_offset;
+        archive.seek(SeekFrom::Start(offset))?;
+
+        let block_header = BlockHeader::read_from_at(archive, offset)?;
+        validate_block_header(&block_header, block_entry, offset)?;
+
+        let mut payload = vec![0u8; block_header.compressed_size as usize];
+        archive.read_exact(&mut payload)?;
+
+        let trailer = BlockTrailer::read_from_with_id(archive, block_header.block_id)?;
+        let payload = maybe_decrypt_payload(payload, decrypt_key, block_header.block_id)?;
+
+        Ok(RawBlock {
+            global_idx,
+            payload,
+            compression_method: block_header.compression_method,
+            uncompressed_size: block_header.uncompressed_size as usize,
+            content_blake3: trailer.content_blake3,
+            block_id: block_header.block_id,
+            archive_offset: offset,
+            solid_group_id: block_header.solid_group_id,
+        })
+    }
+
     /// Decompress all blocks in parallel (requires the `threading` feature).
     ///
     /// Two phases:
@@ -723,18 +842,9 @@ impl Decompressor {
         // with many blocks claiming large compressed_size (matching sequential path).
         let mut total_compressed_read: u64 = 0;
         for (i, block_entry) in metadata.block_index.iter().enumerate() {
-            let offset = block_entry.archive_offset;
-            archive.seek(SeekFrom::Start(offset))?;
+            let block = self.read_raw_block(archive, i, block_entry, decrypt_key)?;
 
-            let block_header = BlockHeader::read_from_at(archive, offset)?;
-            validate_block_header(&block_header, block_entry, offset)?;
-
-            // Read compressed (possibly encrypted) payload
-            let mut payload = vec![0u8; block_header.compressed_size as usize];
-            archive.read_exact(&mut payload)?;
-
-            // Cumulative compressed size tracking (matching sequential path)
-            total_compressed_read += block_header.compressed_size as u64;
+            total_compressed_read += block.payload.len() as u64;
             if total_compressed_read > MAX_TOTAL_COMPRESSED_READ_SIZE {
                 return Err(AetherError::ResourceLimitExceeded(format!(
                     "Total compressed read size {} exceeds safety limit of {} bytes",
@@ -742,22 +852,7 @@ impl Decompressor {
                 )));
             }
 
-            // Read and verify trailer
-            let trailer = BlockTrailer::read_from_with_id(archive, block_header.block_id)?;
-
-            // Decrypt if the archive is encrypted
-            let payload = maybe_decrypt_payload(payload, decrypt_key, block_header.block_id)?;
-
-            raw_blocks.push(RawBlock {
-                global_idx: i,
-                payload,
-                compression_method: block_header.compression_method,
-                uncompressed_size: block_header.uncompressed_size as usize,
-                content_blake3: trailer.content_blake3,
-                block_id: block_header.block_id,
-                archive_offset: offset,
-                solid_group_id: block_header.solid_group_id,
-            });
+            raw_blocks.push(block);
         }
 
         // S7 security fix: pre-check total expected decompressed size before
