@@ -249,7 +249,22 @@ per block and continue. Measured through the CLI: a 57-file source tree goes
 `verify_reports_the_same_corruption_at_every_thread_count` corrupts two block
 payloads and checks that every thread count reports exactly the same two.
 
-### 9. Reassembly and I/O
+### 9. The decompress-only build
+
+`aether-core --no-default-features` — and therefore `aether-wasm`, which is
+decompress-only by design — did not compile. `bwt-encode` gates the
+libsais-backed forward transform, but the router's BWT trial and the
+transformed dictionary trainer called it ungated, so the crate only built when
+another workspace member turned the feature back on through Cargo's feature
+unification. `cargo build --workspace` hid it; `cargo build -p aether-wasm`
+did not.
+
+Decoding `BwtPredictorRans` blocks was never gated, so the fix is confined to
+the encode side: the router's BWT trial is skipped and the cascade falls
+through, and `Dictionary::train_transformed` returns an explanatory error
+rather than not existing.
+
+### 10. Reassembly and I/O
 
 * Extraction takes each block out of the array as it consumes it, instead of
   holding every decompressed block until the last file is written. A

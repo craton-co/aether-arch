@@ -263,6 +263,7 @@ fn bwt_decode_with(
 /// Uses stack-allocated `[u8; 256]` arrays for cache efficiency:
 /// - `pos[byte]` = current rank → O(1) lookup (no linear scan)
 /// - Shift loop is O(rank), not O(256), so rank-0 symbols cost zero
+#[cfg(any(feature = "bwt-encode", test))]
 fn mtf_encode(data: &[u8]) -> Vec<u8> {
     let mut list = [0u8; 256]; // list[rank] = byte value
     let mut pos = [0u8; 256]; // pos[byte] = current rank

@@ -62,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   planes are independent Order0 streams and that decode is most of the method
   (2.6x on a 512 KiB float array).
 
+- **The decompress-only build compiles again.** `aether-core` with
+  `--no-default-features` (and therefore `aether-wasm`, which is decompress
+  only) failed to build: `bwt-encode` gates the libsais-backed forward
+  transform, but two callers were not gated, so the crate only compiled when
+  something else in the workspace turned the feature back on through feature
+  unification. `cargo build -p aether-wasm` now works on its own. Decoding
+  `BwtPredictorRans` blocks was never gated and is unaffected;
+  `Dictionary::train_transformed` now returns a clear error instead of failing
+  to compile.
+
 ### Added
 
 - `benches/decompression.rs`: Criterion benchmarks isolating the decode loop,

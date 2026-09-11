@@ -42,9 +42,10 @@ use crate::coding::lz_preprocess;
 use crate::coding::{bcj, bwt_preprocess, lz77_preprocess, rans, zstd_fallback};
 use crate::entropy::{NeuralSsmPredictor, ProbabilityPredictor};
 use crate::error::{AetherError, Result};
+#[cfg(feature = "bwt-encode")]
+use crate::format::BWT_ENTROPY_SKIP;
 use crate::format::{
-    CompressionMethod, ContentType, BWT_DECISIVE_RATIO, BWT_ENTROPY_SKIP,
-    MAX_DECOMPRESSED_BLOCK_SIZE,
+    CompressionMethod, ContentType, BWT_DECISIVE_RATIO, MAX_DECOMPRESSED_BLOCK_SIZE,
 };
 use crate::pipeline::compress::CompressionProfile;
 
@@ -195,6 +196,12 @@ pub fn compress_chunk(
             // near-random data.  Text is typically 4-5 bps.
             // The shared threshold is also used by transformed dictionary
             // training so the two paths cannot silently diverge.
+            //
+            // Gated on `bwt-encode`: the forward transform needs libsais.
+            // A decompress-only build (wasm) still *decodes* BwtPredictorRans
+            // blocks — only the encode-side trial is unavailable, so the
+            // cascade falls through to LZ77/plain/Zstd.
+            #[cfg(feature = "bwt-encode")]
             if chunk.data.len() >= 8 && chunk.entropy < BWT_ENTROPY_SKIP {
                 if let Ok((primary_index, mtf_data)) =
                     bwt_preprocess::bwt_mtf_encode_parts(chunk.data)
