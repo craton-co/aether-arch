@@ -580,22 +580,29 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
             }
         };
 
-        // Invariant: boundary(lo) <= freq < boundary(hi).
+        // Invariant: boundary(lo) <= freq < boundary(hi), with the bounding
+        // values carried along so the interval falls out of the search
+        // instead of costing two more quantisations at the end.
         // Seeded by boundary(0) == 0 and boundary(256) == PROB_TOTAL, and the
         // caller clamps freq to PROB_TOTAL - 1.
         debug_assert!(freq < PROB_TOTAL);
         let mut lo = 0usize;
+        let mut lo_value = 0u32;
         let mut hi = 256usize;
+        let mut hi_value = PROB_TOTAL;
         while hi - lo > 1 {
             let mid = (lo + hi) >> 1;
-            if boundary(mid) <= freq {
+            let mid_value = boundary(mid);
+            if mid_value <= freq {
                 lo = mid;
+                lo_value = mid_value;
             } else {
                 hi = mid;
+                hi_value = mid_value;
             }
         }
 
-        (lo as u8, boundary(lo) as u16, boundary(hi) as u16)
+        (lo as u8, lo_value as u16, hi_value as u16)
     }
 
     #[inline]
