@@ -1,7 +1,20 @@
 # Per-Symbol CDF API — Design & Extension Plan
 
-**Status**: Prototype landed (Order0 only). Encode-asymmetric.
+**Status**: Encode fast path landed (Order0, then NeuralSSM in 0.3.0).
 **Target**: 2–3× speedup on the predictor (currently 92% of compress wall-clock).
+
+> **Superseded in two places.** Read the corrections before acting on this
+> document:
+>
+> * The "Why decode is left alone" and "Decoder fast path sketch" sections
+>   below argued the decode side could not win. It can, and it did — 1.87x —
+>   by a route this document did not consider. Both sections are annotated
+>   inline; [`decompression.md`](decompression.md) has the real design.
+> * The Order0 `query_cdf` fast path described here was **not** bit-identical
+>   to `predict_cdf`. It reproduced the cumulative rounding and the
+>   monotonicity fix-up but not the whole-table overshoot fallback, which
+>   silently desynchronised encoder and decoder on skewed distributions and
+>   produced unreadable archives. Corrected; see the annotation in §3.
 
 ## Motivation
 
@@ -52,9 +65,40 @@ that can chain. A pure prefix-sum + scale jump is **not bit-identical to
 the decoder's `predict_cdf`** and would silently desync. Replaying the
 sweep up to `byte+1` is the smallest correct shortcut.
 
+> **Correction.** It was not a correct shortcut. `predict_cdf` has a *third*
+> stage this description omits: if the fix-up pushes `cdf[256]` past
+> `PROB_TOTAL`, it discards the table and rebuilds it via `probs_to_cdf`.
+> That is a whole-table decision and cannot be observed from a sweep that
+> stops at `byte + 1`, so the partial sweep silently disagreed with the
+> decoder whenever it fired — which is routinely, on the skewed
+> distributions byte-plane blocks are made of. Archives written with the
+> uncorrected fast path can be unreadable.
+>
+> The shortcut is only valid when `total <= PROB_TOTAL`: every symbol then
+> holds at least one count, no rounded gap can collapse, and neither the
+> fix-up nor the overshoot can fire. Above that the full sweep is replayed
+> (without materialising the table) and delegates to `predict_cdf` when it
+> would have overshot. `query_cdf_matches_predict_cdf_on_skewed_counts`
+> pins the agreement.
+
 Files: `aether-core/src/entropy/order0.rs` (`query_cdf`).
 
 ## Why decode is left alone
+
+> **Superseded.** The argument in this section is sound given its premise —
+> that a decode-side search must call `query_cdf` once per probe, re-running
+> the whole model each time. That premise does not hold. The model pass and
+> the *quantisation* are separable: run the model once, then search only the
+> quantised boundaries. `ProbabilityPredictor::decode_symbol(freq)` does
+> exactly that, and `NeuralSsmPredictor` implements it in about nine
+> boundary evaluations instead of 256, measured at **1.87x** on the decode
+> loop. See [`decompression.md`](decompression.md) §2.
+>
+> The section is kept because its cost model is still the right way to
+> evaluate a *new* predictor's decode path, and because the conclusion it
+> reaches — "leave decode alone" — is correct for `Order0Model`, where the
+> chained fix-up genuinely blocks a boundary search. That was re-measured
+> and re-confirmed: 0.90x and 0.52x.
 
 Decode is genuinely different: it has a codeword in `[0, PROB_TOTAL)` and
 must find the symbol whose CDF interval contains it. With access only to
@@ -183,6 +227,11 @@ copy, ~5% win at most.
 
 ## Decoder fast path sketch (and why we shouldn't bother yet)
 
+> **Superseded.** The sketch below binary-searches by calling `query_cdf`
+> per probe, which is what makes it lose. The shipped design searches the
+> boundaries of a single model evaluation instead. See
+> [`decompression.md`](decompression.md).
+
 The natural decode-side equivalent of `query_cdf` is "find the symbol s
 where `cdf[s] ≤ codeword < cdf[s+1]`" using O(log 256) = 8 `query_cdf`
 calls — a binary search over symbols:
@@ -213,6 +262,11 @@ get back to today's algorithm with one less allocation.
 
 Conclusion: leave decode on `predict_cdf` indefinitely. The encode-only
 asymmetry is the right answer.
+
+> **Superseded.** "Indefinitely" lasted until the model evaluation and the
+> quantisation were separated. The asymmetry is real but narrower than
+> stated: the decoder does need to *search*, and it does need the model
+> evaluated once — but it never needed 256 boundaries materialised.
 
 ## Measured impact (this prototype)
 

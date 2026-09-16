@@ -100,9 +100,10 @@ enum Commands {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         password: Option<String>,
 
-        /// Decompression threads (enterprise): 0=all cores, 1=sequential (default), N=bounded
-        #[arg(short = 't', long, default_value = "1")]
-        threads: usize,
+        /// Decompression worker threads: 0=all cores, 1=sequential, N=bounded.
+        /// Defaults to half the available cores. Needs the 'threading' feature.
+        #[arg(short = 't', long)]
+        threads: Option<usize>,
 
         /// Path to a pretrained dictionary (.aed) for dictionary-compressed archives
         #[arg(long)]
@@ -963,11 +964,13 @@ fn main() -> Result<()> {
             require_enterprise_for_password(&resolved_pw, "extraction")?;
 
             // Q7: validate thread count
-            if threads > MAX_THREADS {
-                anyhow::bail!(
-                    "Thread count {threads} exceeds maximum ({MAX_THREADS}). \
-                     Use 0 for all cores or a reasonable value."
-                );
+            if let Some(count) = threads {
+                if count > MAX_THREADS {
+                    anyhow::bail!(
+                        "Thread count {count} exceeds maximum ({MAX_THREADS}). \
+                         Use 0 for all cores or a reasonable value."
+                    );
+                }
             }
 
             if is_streaming(&input) {
@@ -1011,29 +1014,29 @@ fn main() -> Result<()> {
                     archive_uses_dictionary(&input),
                 )?;
 
-                #[cfg(feature = "enterprise")]
-                if threads != 1 {
-                    decompressor = decompressor.with_max_threads(threads);
+                #[cfg(feature = "threading")]
+                if let Some(count) = threads {
+                    decompressor = decompressor.with_max_threads(count);
+                }
+                #[cfg(not(feature = "threading"))]
+                if threads.is_some_and(|count| count != 1) {
                     eprintln!(
-                        "Parallel decompression: {} thread(s)",
-                        if threads == 0 {
-                            "all".to_string()
-                        } else {
-                            threads.to_string()
-                        }
+                        "Warning: --threads requires the 'threading' feature. \
+                         Using sequential decompression."
                     );
                 }
-                #[cfg(not(feature = "enterprise"))]
-                if threads != 1 {
-                    eprintln!("Warning: --threads requires the 'enterprise' feature. Using sequential decompression.");
-                }
 
-                let mut archive = std::fs::File::open(&input)
-                    .with_context(|| format!("Cannot open {}", input.display()))?;
+                // Buffered: the seekable path reads the file table, the solid
+                // group table and the block index one small struct at a time,
+                // which is a syscall per entry on an unbuffered handle.
+                let mut archive = BufReader::new(
+                    std::fs::File::open(&input)
+                        .with_context(|| format!("Cannot open {}", input.display()))?,
+                );
 
                 let start = Instant::now();
 
-                if let Some(ref file_path) = file {
+                let extracted_bytes = if let Some(ref file_path) = file {
                     // S1: validate extraction path against directory traversal
                     let out_path = safe_join(&output, file_path)?;
                     if let Some(parent) = out_path.parent() {
@@ -1042,18 +1045,26 @@ fn main() -> Result<()> {
                     let mut out_file = std::fs::File::create(&out_path)?;
                     decompressor.extract_file(&mut archive, file_path, &mut out_file)?;
                     eprintln!("Extracted: {}", out_path.display());
+                    std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0)
                 } else {
                     std::fs::create_dir_all(&output)?;
+                    let total = decompressor
+                        .list_files(&mut archive)
+                        .map(|files| files.iter().map(|f| f.original_size).sum::<u64>())
+                        .unwrap_or(0);
                     decompressor.extract_all(&mut archive, &output)?;
                     eprintln!("Extracted to: {}", output.display());
-                }
+                    total
+                };
 
                 let elapsed = start.elapsed();
-                let archive_size = std::fs::metadata(&input)?.len();
                 eprintln!("Time: {:.2?}", elapsed);
-                if archive_size > 0 {
-                    let speed = archive_size as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
-                    eprintln!("Speed: {speed:.1} MiB/s (archive throughput)");
+                if extracted_bytes > 0 && elapsed.as_secs_f64() > 0.0 {
+                    // Report throughput over the bytes produced, not the bytes
+                    // read: an archive-size rate makes a decompressor look
+                    // faster the better it compressed, which is backwards.
+                    let speed = extracted_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+                    eprintln!("Speed: {speed:.1} MiB/s (decompressed)");
                 }
             }
 

@@ -88,6 +88,25 @@ impl Dictionary {
     /// distribution. This mirrors the router's chunk → BWT+MTF → RLE pipeline
     /// (including the high-entropy BWT skip) and accumulates state across the
     /// whole corpus without resetting, producing a "warmed" baseline.
+    ///
+    /// Requires the `bwt-encode` feature: producing the transformed stream
+    /// means running the forward BWT, which is libsais-backed. A
+    /// decompress-only build can still *read* dictionary-compressed archives,
+    /// it just cannot train a transformed dictionary.
+    #[cfg(not(feature = "bwt-encode"))]
+    pub fn train_transformed(
+        _predictor: &mut dyn ProbabilityPredictor,
+        _training_files: &[impl AsRef<Path>],
+    ) -> Result<Self> {
+        Err(AetherError::Compression(
+            "Transformed dictionary training requires the 'bwt-encode' feature \
+             (the forward BWT is libsais-backed). Decompression of \
+             dictionary-compressed archives is unaffected."
+                .into(),
+        ))
+    }
+
+    #[cfg(feature = "bwt-encode")]
     pub fn train_transformed(
         predictor: &mut dyn ProbabilityPredictor,
         training_files: &[impl AsRef<Path>],

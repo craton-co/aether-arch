@@ -21,7 +21,7 @@
 //! Only 2*(D+1) = 66 learnable parameters (at D=32) → adapts rapidly from scratch.
 //! Memory: ~25 KiB total (embedding table + SSM state + RlePredictor).
 
-use super::rle_predictor::RlePredictor;
+use super::rle_predictor::{RlePredictor, ALPHA_LIT};
 use super::traits::ProbabilityPredictor;
 use crate::format::PredictorId;
 
@@ -220,7 +220,9 @@ pub struct NeuralSsmPredictor {
     prev_prev_byte: u8,
 
     // ── Cached predictions ────────────────────────────────────
-    last_rle_probs: [f32; 256],
+    // Only the four binary probabilities are cached: `update` scores the
+    // mixer on the run/literal and RUNA/RUNB decisions, and nothing reads a
+    // cached 256-entry literal distribution.
     last_ssm_p_run: f32,
     last_ssm_p_runa: f32,
     last_rle_p_run: f32,
@@ -332,7 +334,6 @@ impl NeuralSsmPredictor {
             o2_lit_totals: [0u32; NUM_O2_CTX],
             prev_byte: 0xFF, // sentinel: no previous byte
             prev_prev_byte: 0xFF,
-            last_rle_probs: [1.0 / 256.0; 256],
             last_ssm_p_run: 0.5,
             last_ssm_p_runa: 0.5,
             last_rle_p_run: 0.5,
@@ -409,12 +410,17 @@ impl NeuralSsmPredictor {
     /// interval query and decoder CDF paths.
     #[inline]
     fn model_weights(&mut self) -> ([f32; 256], f32) {
-        let rle_probs = self.rle.predict();
-        self.last_rle_probs = rle_probs;
+        // Decomposed rather than `self.rle.predict()`: the array form would
+        // build and copy 1 KiB per predicted byte, all of which is folded
+        // into `weights` below. The arithmetic is unchanged — see
+        // `RlePredictor::model_parts`.
+        let (rle_run, rle_runa_given_run, rle_lit_scale, rle_lit_counts) = self.rle.model_parts();
+        let rle_p0 = rle_run * rle_runa_given_run;
+        let rle_p1 = rle_run * (1.0 - rle_runa_given_run);
 
-        let rle_p_run = rle_probs[0] + rle_probs[1];
+        let rle_p_run = rle_p0 + rle_p1;
         let rle_p_runa = if rle_p_run > MIN_PROB {
-            rle_probs[0] / rle_p_run
+            rle_p0 / rle_p_run
         } else {
             0.5
         };
@@ -444,7 +450,10 @@ impl NeuralSsmPredictor {
         let mut sum = weights[0] + weights[1];
 
         for i in 2..256 {
-            let rle_p = rle_probs[i] * inv_rle_lit;
+            // `(count + ALPHA_LIT) * rle_lit_scale` is exactly what
+            // `RlePredictor::predict()[i]` would have been.
+            let rle_prob = (rle_lit_counts[i - 2] as f32 + ALPHA_LIT) * rle_lit_scale;
+            let rle_p = rle_prob * inv_rle_lit;
             let lit_p = if use_o2 {
                 let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
                 rle_weight * rle_p + eff_blend * o2_p
@@ -457,6 +466,20 @@ impl NeuralSsmPredictor {
         }
 
         (weights, sum)
+    }
+
+    /// Prefix sums of `weights` in the exact accumulation order
+    /// `predict_cdf` uses, so `quantized_boundary(prefix[i], total, i)`
+    /// reproduces `predict_cdf()[i]` bit-for-bit.
+    #[inline]
+    fn weight_prefix(weights: &[f32; 256]) -> [f64; 256] {
+        let mut prefix = [0.0f64; 256];
+        let mut cumulative = 0.0f64;
+        for i in 0..256 {
+            prefix[i] = cumulative;
+            cumulative += weights[i] as f64;
+        }
+        prefix
     }
 
     /// Quantize cumulative mass while reserving one count per symbol.
@@ -506,140 +529,7 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
             cumulative += weights[i] as f64;
         }
         monotone_cdf[256] = PROB_TOTAL as u16;
-        return monotone_cdf;
-
-        // Retained as a compile-disabled reference for ratio/performance
-        // comparisons against the pre-0.3 quantizer.
-        #[cfg(any())]
-        {
-            // 1. Get RLE baseline prediction
-            let rle_probs = self.rle.predict();
-            self.last_rle_probs = rle_probs;
-
-            // 2. Extract RLE's binary decisions
-            let rle_p_run = rle_probs[0] + rle_probs[1];
-            let rle_p_runa = if rle_p_run > MIN_PROB {
-                rle_probs[0] / rle_p_run
-            } else {
-                0.5
-            };
-            self.last_rle_p_run = rle_p_run;
-            self.last_rle_p_runa = rle_p_runa;
-
-            // 3. Get SSM's binary predictions
-            let (ssm_p_run, ssm_p_runa) = self.ssm_binary_predict();
-            self.last_ssm_p_run = ssm_p_run;
-            self.last_ssm_p_runa = ssm_p_runa;
-
-            // 4. Mix binary decisions
-            let alpha = self.mixing_alpha();
-            let beta = 1.0 - alpha;
-            let p_run = alpha * ssm_p_run + beta * rle_p_run;
-            let p_runa = alpha * ssm_p_runa + beta * rle_p_runa;
-
-            // 5. Build CDF directly via cumulative rounding in f32.
-            // Same algorithm as probs_to_cdf's core loop but avoids:
-            // - f64 upcasting of all 256 probabilities
-            // - the expensive fixup path (sort + proportional redistribution)
-            // - materializing a separate [f32;256] intermediate for predict()
-            let rle_p_lit_total = (1.0 - rle_p_run).max(MIN_PROB);
-            let o2_ctx = Self::o2_context(self.prev_byte, self.prev_prev_byte);
-            let o2_obs = self.o2_lit_totals[o2_ctx];
-            let o2_total = o2_obs as f32 + 254.0 * O2_ALPHA;
-            // Confidence-weighted blend (Stage B) — MUST match predict() exactly so
-            // the [f32;256] and direct-CDF paths agree.
-            let eff_blend = self.cfg.o2_lit_blend * (o2_obs as f32 / (o2_obs as f32 + O2_CONF_K));
-
-            // First pass: compute raw probs and sum.
-            // Precompute reciprocals to replace 254+ divisions with multiplies.
-            let inv_rle_lit = 1.0 / rle_p_lit_total;
-            let inv_o2_total = 1.0 / o2_total;
-            let rle_weight = 1.0 - eff_blend;
-            let use_o2 = eff_blend > 0.0;
-
-            let mut raw = [0.0f32; 256];
-            raw[0] = (p_run * p_runa).max(MIN_PROB);
-            raw[1] = (p_run * (1.0 - p_runa)).max(MIN_PROB);
-            let p_lit = 1.0 - p_run;
-            let mut sum = raw[0] + raw[1];
-            for i in 2..256 {
-                let rle_p = rle_probs[i] * inv_rle_lit;
-                let lit_p = if use_o2 {
-                    let o2_p = (self.o2_lit_counts[o2_ctx][i - 2] as f32 + O2_ALPHA) * inv_o2_total;
-                    rle_weight * rle_p + eff_blend * o2_p
-                } else {
-                    rle_p
-                };
-                let p = (p_lit * lit_p).max(MIN_PROB);
-                raw[i] = p;
-                sum += p;
-            }
-
-            // Cumulative rounding: same precision as probs_to_cdf but in f32.
-            //
-            // ── Early-exit overshoot detection ────────────────────────────
-            //
-            // On real NeuralSSM data (BWT+MTF+RLE of English text), the
-            // overshoot fallback fires on ~98.76% of bytes — measured via
-            // the `query_cdf_overshoot_rate_on_bench_corpus` diagnostic.
-            // Each overshoot wastes both the f32 cumulative-rounding sweep
-            // AND the f32 monotonicity fix-up before calling `probs_to_cdf`.
-            //
-            // Observation: overshoot is GUARANTEED whenever the rounded gap
-            // `cur - prev` is zero anywhere in the interior. The fix-up loop
-            // would then bump `cdf[i+1] = cdf[i] + 1`, and any such bump
-            // pushes `cdf[256]` past `PROB_TOTAL` (since the rounded
-            // `cdf[256]` is anchored at `PROB_TOTAL` and bumps only ever
-            // increase). So we can break out of the rounding loop the
-            // instant we see `cur <= prev` and fall straight to
-            // `probs_to_cdf` — bit-identical to running the full f32 path
-            // and then hitting the same fallback.
-            //
-            // For peaked NeuralSSM distributions this typically triggers at
-            // i ≈ 3..10 (just past the RUNA/RUNB peak), so we skip ~250
-            // iterations of pass 2 + all 256 of pass 3 on every overshoot
-            // byte. The `predict_cdf_early_exit_microbench` test measures a
-            // **+19.08% speedup (1.24x)** on the BWT-encoded English corpus
-            // the `compress_ssm` criterion bench uses, with bit-identity to
-            // the reference verified by `predict_cdf_early_exit_matches_reference`.
-            let scale = PROB_TOTAL as f32 / sum;
-            let mut cdf = [0u16; 257];
-            let mut cum = 0.0f32;
-            let mut prev: u16 = 0;
-            for i in 0..256 {
-                let cur = (cum * scale + 0.5) as u16;
-                // i > 0 because cdf[0] = 0 by initialization and the first
-                // rounded value (i=0) is also 0 — the `<=` would trigger
-                // spuriously. From i=1 onward, `cur <= prev` means a zero
-                // rounded gap → fix-up will bump → overshoot guaranteed.
-                if i > 0 && cur <= prev {
-                    return crate::coding::rans::probs_to_cdf(&raw);
-                }
-                cdf[i] = cur;
-                prev = cur;
-                cum += raw[i];
-            }
-            cdf[256] = PROB_TOTAL as u16;
-
-            // Ensure strict monotonicity. With the early-exit above, all
-            // interior gaps are guaranteed >= 1, so the only entry the
-            // fix-up can touch is cdf[256] (when cdf[255] rounds up to
-            // PROB_TOTAL on a floating-point boundary). We still need this
-            // loop for that edge case, but it's a no-op for indices 0..255
-            // in the hot path.
-            for i in 0..256 {
-                if cdf[i + 1] <= cdf[i] {
-                    cdf[i + 1] = cdf[i] + 1;
-                }
-            }
-
-            // If forward fixup overshot, fall back to full probs_to_cdf.
-            if cdf[256] != PROB_TOTAL as u16 {
-                return crate::coding::rans::probs_to_cdf(&raw);
-            }
-
-            cdf
-        }
+        monotone_cdf
     }
 
     /// Encode-only fast path that computes just the selected symbol interval.
@@ -659,6 +549,60 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
             Self::quantized_boundary(cumulative, sum as f64, symbol + 1)
         };
         (lo, hi)
+    }
+
+    /// Decode-only fast path: locate the symbol whose interval contains
+    /// `freq` without materialising the CDF.
+    ///
+    /// `predict_cdf` spends one `quantized_boundary` call — a `f64` multiply,
+    /// divide and floor — on each of the 256 boundaries, then the range
+    /// decoder binary-searches the table and reads exactly two of them. The
+    /// boundaries are non-decreasing in the symbol index, so the search can
+    /// run directly over them and evaluate only the ~9 it visits.
+    ///
+    /// Bit-identity with `predict_cdf` is what keeps the decoder in lockstep
+    /// with the encoder, and rests on `weight_prefix` accumulating in the same
+    /// order `predict_cdf` does; `decode_symbol_matches_predict_cdf` checks it
+    /// over the whole frequency space.
+    #[inline]
+    fn decode_symbol(&mut self, freq: u32) -> (u8, u16, u16) {
+        use crate::coding::rans::PROB_TOTAL;
+
+        let (weights, sum) = self.model_weights();
+        let total = sum as f64;
+        let prefix = Self::weight_prefix(&weights);
+
+        let boundary = |i: usize| -> u32 {
+            if i == 256 {
+                PROB_TOTAL
+            } else {
+                Self::quantized_boundary(prefix[i], total, i) as u32
+            }
+        };
+
+        // Invariant: boundary(lo) <= freq < boundary(hi), with the bounding
+        // values carried along so the interval falls out of the search
+        // instead of costing two more quantisations at the end.
+        // Seeded by boundary(0) == 0 and boundary(256) == PROB_TOTAL, and the
+        // caller clamps freq to PROB_TOTAL - 1.
+        debug_assert!(freq < PROB_TOTAL);
+        let mut lo = 0usize;
+        let mut lo_value = 0u32;
+        let mut hi = 256usize;
+        let mut hi_value = PROB_TOTAL;
+        while hi - lo > 1 {
+            let mid = (lo + hi) >> 1;
+            let mid_value = boundary(mid);
+            if mid_value <= freq {
+                lo = mid;
+                lo_value = mid_value;
+            } else {
+                hi = mid;
+                hi_value = mid_value;
+            }
+        }
+
+        (lo as u8, lo_value as u16, hi_value as u16)
     }
 
     #[inline]
@@ -773,7 +717,6 @@ impl ProbabilityPredictor for NeuralSsmPredictor {
         self.o2_lit_totals.fill(0);
         self.prev_byte = 0xFF;
         self.prev_prev_byte = 0xFF;
-        self.last_rle_probs.fill(1.0 / 256.0);
         self.last_ssm_p_run = 0.5;
         self.last_ssm_p_runa = 0.5;
         self.last_rle_p_run = 0.5;
@@ -1032,7 +975,6 @@ impl NeuralSsmPredictor {
         // expected to leave the predictor in the same post-predict
         // state. The bit-identity test relies on this.
         let rle_probs = self.rle.predict();
-        self.last_rle_probs = rle_probs;
 
         let rle_p_run = rle_probs[0] + rle_probs[1];
         let rle_p_runa = if rle_p_run > MIN_PROB {
@@ -1120,6 +1062,89 @@ mod tests {
     }
 
     /// Bit-identity guard for the encode-only query and decoder CDF paths.
+    /// The decode-side mirror of `query_cdf_matches_decoder_cdf`.
+    ///
+    /// `decode_symbol` resolves the symbol by searching the quantised
+    /// boundaries directly instead of building the 257-entry table, so it
+    /// must return exactly what `predict_cdf` + the range decoder's
+    /// `find_symbol` would have returned — for **every** cumulative frequency
+    /// the decoder can present, not just the ones a sample stream happens to
+    /// produce. Anything less and a rare frequency desynchronises a real
+    /// archive while the tests stay green.
+    #[test]
+    fn decode_symbol_matches_predict_cdf_over_full_frequency_space() {
+        use crate::coding::rans::{find_symbol, PROB_TOTAL};
+
+        // RUNA/RUNB-heavy stream, the shape the BWT+MTF+RLE path produces.
+        let mut state = 0x9e37_79b9u32;
+        let mut next_byte = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            match (state >> 24) & 0x7 {
+                0..=3 => 0u8,
+                4 => 1,
+                _ => ((state >> 8) & 0xFF) as u8,
+            }
+        };
+
+        let mut predictor = NeuralSsmPredictor::new();
+        let mut fed = 0usize;
+
+        // Checkpoints at increasing depths: fresh state, past the mixer
+        // warm-up, and deep enough that the order-2 contexts carry weight.
+        for &depth in &[0usize, 64, 512, 4096] {
+            while fed < depth {
+                predictor.update(next_byte());
+                fed += 1;
+            }
+
+            let reference = predictor.predict_cdf();
+            for freq in 0..PROB_TOTAL {
+                let expected = find_symbol(&reference, freq);
+                let (symbol, lo, hi) = predictor.decode_symbol(freq);
+                assert_eq!(
+                    symbol as usize, expected,
+                    "symbol diverged at depth {depth}, freq {freq}",
+                );
+                assert_eq!(
+                    (lo, hi),
+                    (reference[expected], reference[expected + 1]),
+                    "interval diverged at depth {depth}, freq {freq} (symbol {expected})",
+                );
+            }
+        }
+    }
+
+    /// `predict()` and `model_weights()` must still agree with the RLE
+    /// baseline now that the baseline is consumed in decomposed form.
+    #[test]
+    fn rle_model_parts_reconstructs_predict() {
+        let mut rle = RlePredictor::new();
+        let mut state = 0x1234_5678u32;
+        for step in 0..2048 {
+            let reference = rle.predict();
+            let (p_run, p_runa, scale, counts) = rle.model_parts();
+            assert_eq!(reference[0], p_run * p_runa, "RUNA mismatch at step {step}");
+            assert_eq!(
+                reference[1],
+                p_run * (1.0 - p_runa),
+                "RUNB mismatch at step {step}"
+            );
+            for i in 0..254 {
+                assert_eq!(
+                    reference[i + 2],
+                    (counts[i] as f32 + ALPHA_LIT) * scale,
+                    "literal {i} mismatch at step {step}",
+                );
+            }
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            rle.update(match (state >> 24) & 0x7 {
+                0..=3 => 0,
+                4 => 1,
+                _ => ((state >> 8) & 0xFF) as u8,
+            });
+        }
+    }
+
     #[test]
     fn query_cdf_matches_decoder_cdf() {
         // Use the same bias as roundtrip_with_range_coder: heavy RUNA/RUNB
@@ -1357,10 +1382,6 @@ mod tests {
         assert_eq!(
             pred.prev_prev_byte, fresh.prev_prev_byte,
             "prev_prev_byte mismatch"
-        );
-        assert_eq!(
-            pred.last_rle_probs, fresh.last_rle_probs,
-            "last_rle_probs mismatch"
         );
         assert_eq!(
             pred.last_ssm_p_run, fresh.last_ssm_p_run,

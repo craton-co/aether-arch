@@ -10,7 +10,18 @@ Speed varies significantly by corpus size:
 - **Internal (2.6 MiB)**: 3.7 MiB/s compression, 3.6 MiB/s decompression; ratio 2.75% (0.220 bpb)
 - **Silesia (202 MiB)**: 0.4 MiB/s compression (ssm), 0.3 MiB/s decompression; ratio 26.55% (2.124 bpb)
 
+> **The decompression figures on this page are superseded.** Post-0.3.0 work
+> removed a per-output-byte predictor pass from the read path, fused the range
+> decoder with the predictor, and made parallel decompression scale and be on
+> by default — none of which is reflected above. Re-measure with
+> `scripts/decompression-matrix.ps1` before quoting a read speed. Per-stage
+> results and the analysis are in [`perf/decompression.md`](perf/decompression.md).
+
 Version history:
+- post-0.3.0: decode/predictor fusion, predictor sync pass removed, per-block
+  parallel decompression on by default, two-chain inverse BWT, divide-free
+  Order0 CDF. Also fixes two decode-path desyncs that made some 0.3.0 archives
+  unreadable.
 - 0.3.0: archival/balanced/fast profiles, x86 BCJ, prefix-compressed paths,
   zero-copy chunk views, NeuralSSM interval query, and decode prefix lookup.
 - 0.2.4: libsais SA-IS (O(n) vs divsufsort O(n log n)), entropy-based BWT skip (>7.0 bps).

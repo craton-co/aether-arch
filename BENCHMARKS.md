@@ -21,6 +21,70 @@ extraction time, and throughput for `archival`, `balanced`, and `fast`.
 Missing workload directories are reported and skipped. Keep published results
 separate from historical values in `docs/BENCHMARKS.md`.
 
+## Decompression
+
+The compression matrix above times one extraction per case — enough to catch a
+regression, not enough to reason about read speed. Two decompression-specific
+tools sit alongside it.
+
+### Per-stage benchmarks
+
+```bash
+cargo bench -p aether-core --bench decompression
+```
+
+Four groups, each isolating a stage so a change can be attributed rather than
+lost in end-to-end noise:
+
+| Group | What it measures |
+|---|---|
+| `decode/*` | The range-decoder hot loop per predictor. This is the stage that dominates every predictor-backed block. |
+| `method/*` | `router::decompress_chunk` per compression method, on payloads produced by the real encoder. |
+| `transform/*` | The inverse transforms: BWT+MTF, RLE, LZ77, byte-plane. |
+| `archive/*` | Metadata parsing, whole-archive extraction, `verify`. |
+
+### Workload matrix
+
+```powershell
+pwsh ./scripts/decompression-matrix.ps1 `
+  -Binary C:\path\to\aet.exe `
+  -DatasetRoot C:\datasets\aether `
+  -Repetitions 5 `
+  -Threads 1,2,4,0 `
+  -OutputCsv decompression-matrix.csv
+```
+
+Same dataset layout as the compression matrix (`text`, `logs`, `binaries`,
+`images`, `tiny`). Differences that matter:
+
+- Compression runs once per case as **untimed setup**.
+- Extraction is repeated and reported as **minimum and median**. Compare the
+  minimum across builds — it is the run least polluted by whatever else the
+  host was doing.
+- Thread counts are swept, so scaling is measured rather than assumed.
+- `verify` (decode without writing files) and single-file extraction (random
+  access via the block index) are measured alongside full extraction; they are
+  separate user-visible operations with different costs.
+- Throughput is reported over **decompressed** bytes. An archive-size rate
+  makes a decompressor look faster the better the compressor did.
+
+### Measuring on a busy machine
+
+Wall-clock on a shared development host varies by a factor of two to four
+between runs — larger than most effects worth measuring. Three rules:
+
+1. **Compare inside one process.** Where both code paths can be compiled
+   together, run them alternately in one binary and take the minimum of
+   several repetitions. Background load then affects both arms equally.
+2. **Never compare across separate benchmark runs.** Criterion's
+   `--save-baseline` is only trustworthy when both arms ran under the same
+   machine conditions.
+3. **Watch the ratio, not the absolute.** A 40% swing in both arms of the same
+   run is the host, not the code.
+
+See [`docs/perf/decompression.md`](docs/perf/decompression.md) for the
+analysis these tools were built to support.
+
 ## Profile-Guided Optimization
 
 AetherArch's hot path is byte-level entropy coding: millions of small

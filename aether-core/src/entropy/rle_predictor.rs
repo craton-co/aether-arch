@@ -26,7 +26,7 @@ const NUM_CONTEXTS: usize = 3;
 /// Virtual pseudocount for binary models.
 const ALPHA_BIN: f32 = 0.5;
 /// Virtual pseudocount per symbol for literal model (254 possible values).
-const ALPHA_LIT: f32 = 0.1;
+pub(crate) const ALPHA_LIT: f32 = 0.1;
 /// Total virtual mass for literal model.
 const ALPHA_LIT_TOTAL: f32 = 254.0 * ALPHA_LIT;
 
@@ -108,6 +108,32 @@ impl RlePredictor {
             CTX_AFTER_LIT
         }
     }
+
+    /// The next prediction in decomposed form, for callers that immediately
+    /// fold this baseline into a larger model.
+    ///
+    /// Returns `(p_run, p_runa_given_run, literal_scale, literal_counts)`.
+    /// These reconstruct [`predict`](ProbabilityPredictor::predict) exactly:
+    ///
+    /// ```text
+    /// probs[0]     = p_run * p_runa_given_run
+    /// probs[1]     = p_run * (1.0 - p_runa_given_run)
+    /// probs[i + 2] = (literal_counts[i] as f32 + ALPHA_LIT) * literal_scale
+    /// ```
+    ///
+    /// [`NeuralSsmPredictor`](crate::entropy::NeuralSsmPredictor) mixes this
+    /// baseline symbol-by-symbol, so materialising the 256-entry array and
+    /// copying it out on every predicted byte was pure memory traffic — over
+    /// a kilobyte per byte of output on the decode hot path.
+    #[inline]
+    pub fn model_parts(&self) -> (f32, f32, f32, &[u32; 254]) {
+        let c = self.ctx;
+        let p_run = self.run_vs_lit[c].p_yes();
+        let p_runa_given_run = self.runa_vs_runb[c].p_yes();
+        let lit_denom = self.lit_totals[c] as f32 + ALPHA_LIT_TOTAL;
+        let literal_scale = (1.0 - p_run) / lit_denom;
+        (p_run, p_runa_given_run, literal_scale, &self.lit_counts[c])
+    }
 }
 
 impl Default for RlePredictor {
@@ -119,24 +145,18 @@ impl Default for RlePredictor {
 impl ProbabilityPredictor for RlePredictor {
     #[inline]
     fn predict(&mut self) -> [f32; 256] {
-        let c = self.ctx;
+        // Expressed via `model_parts` so the array form and the decomposed
+        // form cannot drift apart — `NeuralSsmPredictor` relies on them
+        // producing bit-identical values.
+        let (p_run, p_runa_given_run, scale, lit_entry) = self.model_parts();
         let mut probs = [0.0f32; 256];
 
-        // Step 1: p(run_symbol) vs p(literal)
-        let p_run = self.run_vs_lit[c].p_yes();
-        let p_lit = 1.0 - p_run;
-
-        // Step 2: within run symbols, p(RUNA) vs p(RUNB)
-        let p_runa_given_run = self.runa_vs_runb[c].p_yes();
+        // Step 1+2: p(run_symbol) split into RUNA / RUNB.
         probs[0] = p_run * p_runa_given_run; // RUNA
         probs[1] = p_run * (1.0 - p_runa_given_run); // RUNB
 
-        // Step 3: within literals, distribute p_lit among values 2-255
-        // Precompute p_lit / denom to replace 254 divisions with 254 multiplies.
-        let lit_total = self.lit_totals[c] as f32;
-        let lit_denom = lit_total + ALPHA_LIT_TOTAL;
-        let scale = p_lit / lit_denom;
-        let lit_entry = &self.lit_counts[c];
+        // Step 3: distribute the literal mass among values 2-255. `scale`
+        // folds `p_lit / denom` so this is 254 multiplies, not 254 divides.
         for i in 0..254 {
             probs[i + 2] = (lit_entry[i] as f32 + ALPHA_LIT) * scale;
         }

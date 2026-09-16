@@ -75,9 +75,15 @@ aet compress mydir/ -o archive.aet --analytics        # show compression stats
 ```bash
 aet extract archive.aet -o output_dir/
 aet extract archive.aet -f path/to/file.txt -o .     # single file
-aet extract archive.aet -o output_dir/ --threads 4    # parallel decompression
+aet extract archive.aet -o output_dir/ --threads 0    # all cores
+aet extract archive.aet -o output_dir/ --threads 1    # sequential
 cat archive.aet | aet extract - -o output_dir/        # streaming from stdin
 ```
+
+Extraction is multi-threaded by default (half the available cores). Blocks are
+independently decodable, so the output is byte-identical at every thread count.
+`--threads 0` uses all cores; `--threads 1` is sequential. Streaming extraction
+from stdin is always sequential — it cannot seek.
 
 ### Encryption
 
@@ -339,7 +345,7 @@ AetherArch is licensed under the [Apache License, Version 2.0](LICENSE).
 
 Copyright 2024-2026 Craton Software Company
 
-Enterprise features (encryption, multi-threaded decompression, cloud storage backends)
+Enterprise features (encryption, cloud storage backends)
 are included in the source under the same Apache 2.0 license. Organizations using
 enterprise features in production may purchase a commercial support license — contact
 us at [legal@craton.com.ar](mailto:legal@craton.com.ar) for details.

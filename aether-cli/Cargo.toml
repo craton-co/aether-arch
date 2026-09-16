@@ -12,7 +12,12 @@ name = "aet"
 path = "src/main.rs"
 
 [features]
-enterprise = ["aether-core/enterprise"]
+## Parallel compression and decompression. On by default: `aet` is an
+## application, and released binaries should use the machine they run on.
+## Output is byte-identical to a single-threaded build at every thread count.
+default = ["threading"]
+threading = ["aether-core/threading"]
+enterprise = ["aether-core/enterprise", "threading"]
 
 [dependencies]
 aether-core = { workspace = true }

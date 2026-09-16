@@ -103,9 +103,9 @@ pub struct Decompressor {
     #[cfg(feature = "enterprise")]
     pub(crate) password: Option<zeroize::Zeroizing<Vec<u8>>>,
     // Note: zeroize crate is available when enterprise feature is enabled.
-    /// Maximum threads for parallel decompression (enterprise feature).
-    /// 0 = unlimited (rayon default), 1 = sequential (default).
-    #[cfg(feature = "enterprise")]
+    /// Maximum worker threads for parallel decompression.
+    /// 0 = unlimited (all cores), 1 = sequential.
+    #[cfg(feature = "threading")]
     pub(crate) max_threads: usize,
     /// Dictionary for predictor pretraining.
     pub(crate) dictionary: Option<crate::dictionary::Dictionary>,
@@ -125,8 +125,8 @@ impl Decompressor {
             predictor_factory: Box::new(factory),
             #[cfg(feature = "enterprise")]
             password: None,
-            #[cfg(feature = "enterprise")]
-            max_threads: 1,
+            #[cfg(feature = "threading")]
+            max_threads: crate::pipeline::compress::default_max_threads(),
             dictionary: None,
             no_clobber: false,
         }
@@ -153,18 +153,25 @@ impl Decompressor {
         self
     }
 
-    /// Set the maximum threads for parallel decompression (enterprise feature).
+    /// Set the maximum worker threads for parallel decompression.
     ///
-    /// Parallelizes decompression across solid groups (seekable path only).
-    /// Each group is independent and has its own predictor, so groups can
-    /// be decompressed concurrently.
+    /// Requires the `threading` feature. Parallelizes the seekable path
+    /// across **blocks**: every block is independently decodable (see
+    /// [`decompress_blocks_parallel`] and the router's "Group predictor
+    /// state" note), so no ordering constraint ties blocks together.
     ///
-    /// - `0` = unlimited (use all available cores via rayon)
-    /// - `1` = sequential (default, same as non-enterprise behavior)
-    /// - `N` = use at most N threads
+    /// - `0` = unlimited (all available cores via the global rayon pool)
+    /// - `1` = sequential
+    /// - `N` = at most N worker threads
     ///
-    /// Streaming decompression is always sequential regardless of this setting.
-    #[cfg(feature = "enterprise")]
+    /// Defaults to [`default_max_threads`](crate::pipeline::compress::default_max_threads),
+    /// matching [`Compressor`](crate::pipeline::compress::Compressor).
+    ///
+    /// Output is identical for every thread count. Streaming decompression is
+    /// always sequential regardless of this setting.
+    ///
+    /// [`decompress_blocks_parallel`]: Self::extract_all
+    #[cfg(feature = "threading")]
     pub fn with_max_threads(mut self, max_threads: usize) -> Self {
         self.max_threads = max_threads;
         self
@@ -181,23 +188,34 @@ impl Decompressor {
         self
     }
 
-    /// Create a predictor and apply dictionary state if configured.
+    /// Resolve the dictionary coding baseline the decoder should use, once.
     ///
-    /// Returns an error if dictionary application fails, rather than silently
-    /// producing a predictor with wrong initial state (which would cause
-    /// decompression failures or data corruption).
-    pub(crate) fn create_predictor(&self) -> Result<Box<dyn ProbabilityPredictor>> {
+    /// Decoding a block depends only on its payload, its method, its expected
+    /// size and this baseline (see
+    /// [`router::decompress_chunk_with_baseline`](crate::pipeline::router::decompress_chunk_with_baseline)),
+    /// so there is no reason to construct a predictor per solid group or per
+    /// worker thread — which is what the decode paths used to do, at ~100 MiB
+    /// a time for `ContextMixer`.
+    ///
+    /// Returns `Some(dict.state)` exactly when a dictionary is configured
+    /// *and* the archive's predictor type installs a coding baseline (today
+    /// only NeuralSSM does). With no dictionary this constructs nothing at
+    /// all, which is the common case.
+    pub(crate) fn decode_baseline(&self) -> Result<Option<Vec<u8>>> {
+        let Some(dict) = self.dictionary.as_ref() else {
+            return Ok(None);
+        };
+        // Whether a baseline applies is a property of the predictor type, so
+        // ask one instance — the same question `create_predictor` answers.
         let mut predictor = (self.predictor_factory)();
-        if let Some(ref dict) = self.dictionary {
-            dict.apply(predictor.as_mut()).map_err(|e| {
-                AetherError::Decompression(format!("Failed to apply dictionary to predictor: {e}"))
-            })?;
-            // Stage A: install the same per-block coding baseline the encoder
-            // used, so the router's BWT/LZ77 decode predictors reset to the
-            // identical starting state. Symmetric with compress's compress_group.
-            predictor.set_coding_baseline(&dict.state);
+        dict.apply(predictor.as_mut()).map_err(|e| {
+            AetherError::Decompression(format!("Failed to apply dictionary to predictor: {e}"))
+        })?;
+        if predictor.set_coding_baseline(&dict.state) {
+            Ok(Some(dict.state.clone()))
+        } else {
+            Ok(None)
         }
-        Ok(predictor)
     }
 
     /// Validate that the archive's dictionary hash matches the configured dictionary.
@@ -386,19 +404,17 @@ impl VerificationResult {
 
 // ── Shared helpers (used by both seekable and streaming paths) ──────────────
 
-/// Reassemble a file from decompressed blocks by concatenating the file's
-/// block range and truncating to the original file size.
-pub(crate) fn reassemble_file_from_blocks(
+/// The half-open block range a file occupies, validated against the block
+/// array's length.
+fn file_block_range(
     file_entry: &FileEntry,
-    decompressed_blocks: &[Option<Vec<u8>>],
-) -> Result<Vec<u8>> {
+    block_count: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
     let start = file_entry.chunk_start_idx as usize;
     let count = file_entry.chunk_count as usize;
-
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-
     // M4 security fix: use checked addition to prevent integer overflow on the
     // chunk range (start + count) which comes from untrusted archive data.
     let end = start.checked_add(count).ok_or_else(|| {
@@ -406,23 +422,83 @@ pub(crate) fn reassemble_file_from_blocks(
             "Chunk index overflow: start={start}, count={count}"
         ))
     })?;
+    if end > block_count {
+        // Report the first index that would be out of range, matching what a
+        // per-index scan would have said.
+        return Err(AetherError::BlockNotFound(start.max(block_count) as u32));
+    }
+    Ok(Some(start..end))
+}
+
+/// Truncate to the exact file size — the last chunk may run past the file
+/// boundary — in place rather than by copying the prefix out.
+fn truncate_to_file_size(file_entry: &FileEntry, mut combined: Vec<u8>) -> Vec<u8> {
+    combined.truncate(file_entry.original_size as usize);
+    combined
+}
+
+/// Reassemble a file from decompressed blocks, leaving the blocks in place.
+///
+/// Used where the same block array is read more than once (verification
+/// re-reads it per file), so it cannot consume the blocks.
+pub(crate) fn reassemble_file_from_blocks(
+    file_entry: &FileEntry,
+    decompressed_blocks: &[Option<Vec<u8>>],
+) -> Result<Vec<u8>> {
+    let Some(range) = file_block_range(file_entry, decompressed_blocks.len())? else {
+        return Ok(Vec::new());
+    };
+
     // S3 security fix: cap allocation hint to prevent OOM from crafted
     // archives with inflated original_size in untrusted metadata.
     let capacity = (file_entry.original_size as usize).min(MAX_TOTAL_DECOMPRESSED_SIZE as usize);
     let mut combined = Vec::with_capacity(capacity);
-    for i in start..end {
-        if i >= decompressed_blocks.len() {
-            return Err(AetherError::BlockNotFound(i as u32));
-        }
+    for i in range {
         match &decompressed_blocks[i] {
             Some(data) => combined.extend_from_slice(data),
             None => return Err(AetherError::BlockNotFound(i as u32)),
         }
     }
 
-    // Truncate to exact file size (last chunk may extend past file boundary)
-    let end = (file_entry.original_size as usize).min(combined.len());
-    Ok(combined[..end].to_vec())
+    Ok(truncate_to_file_size(file_entry, combined))
+}
+
+/// Reassemble a file, taking its blocks out of the array as it goes.
+///
+/// Extraction reads each block exactly once — a block belongs to exactly one
+/// file — so the decompressed bytes can be released as the file is built
+/// instead of being held until the whole archive has been written. For a
+/// single-block file this also hands the block's buffer straight through
+/// with no copy at all, which is the common case for small files.
+pub(crate) fn reassemble_file_consuming(
+    file_entry: &FileEntry,
+    decompressed_blocks: &mut [Option<Vec<u8>>],
+) -> Result<Vec<u8>> {
+    let Some(range) = file_block_range(file_entry, decompressed_blocks.len())? else {
+        return Ok(Vec::new());
+    };
+
+    let mut take = |i: usize| -> Result<Vec<u8>> {
+        decompressed_blocks[i]
+            .take()
+            .ok_or(AetherError::BlockNotFound(i as u32))
+    };
+
+    let start = range.start;
+    let mut combined = take(start)?;
+    if range.len() > 1 {
+        // S3 security fix: cap the reservation hint so an inflated
+        // original_size in untrusted metadata cannot force a huge allocation.
+        let capacity =
+            (file_entry.original_size as usize).min(MAX_TOTAL_DECOMPRESSED_SIZE as usize);
+        combined.reserve(capacity.saturating_sub(combined.len()));
+        for i in (start + 1)..range.end {
+            let block = take(i)?;
+            combined.extend_from_slice(&block);
+        }
+    }
+
+    Ok(truncate_to_file_size(file_entry, combined))
 }
 
 /// Validate that a file path from an archive is safe to extract.

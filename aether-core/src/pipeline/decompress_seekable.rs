@@ -7,29 +7,27 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::block::{BlockHeader, BlockIndexEntry, BlockTrailer};
-use crate::entropy::ProbabilityPredictor;
 use crate::error::{AetherError, Result};
 use crate::format::*;
 use crate::header::{ArchiveFooter, FileEntry, SolidGroupEntry};
 use crate::pipeline::router;
 
 use super::decompress::{
-    derive_decrypt_key, hex_str, maybe_decrypt_payload, reassemble_file_from_blocks,
-    write_validated_file, ArchiveMetadata, Decompressor, VerificationResult,
+    derive_decrypt_key, hex_str, maybe_decrypt_payload, reassemble_file_consuming,
+    reassemble_file_from_blocks, write_validated_file, ArchiveMetadata, Decompressor,
+    VerificationResult,
 };
 
 #[cfg(feature = "enterprise")]
 use crate::crypto;
-#[cfg(feature = "enterprise")]
-use std::collections::HashMap;
 
-// ── Parallel decompression types (enterprise) ─────────────────────────────────
+// ── Parallel decompression types ──────────────────────────────────────────────
 
-/// A block's raw data read from disk before decompression.
+/// A block's raw data read from the archive, before decompression.
 ///
-/// Used by the parallel decompression path to separate sequential I/O
-/// from CPU-bound decompression (which can be parallelized across groups).
-#[cfg(feature = "enterprise")]
+/// The parallel path separates sequential I/O (the archive is a single
+/// `Read + Seek` stream) from CPU-bound decoding.
+#[cfg(feature = "threading")]
 struct RawBlock {
     /// Position in the global `decompressed_blocks` array.
     global_idx: usize,
@@ -39,35 +37,30 @@ struct RawBlock {
     compression_method: CompressionMethod,
     /// Original uncompressed size in bytes.
     uncompressed_size: usize,
-    /// Whether predictor sync was skipped during compression.
-    predictor_state_flag: bool,
     /// BLAKE3 hash from the block trailer, for integrity verification.
     content_blake3: [u8; 32],
-    /// Block ID (for error reporting and ordering within a group).
+    /// Block ID (for error reporting).
     block_id: u32,
     /// Archive byte offset (for error reporting).
     archive_offset: u64,
-    /// Solid group this block belongs to.
+    /// Solid group this block belongs to (for error reporting).
     solid_group_id: u32,
 }
 
-/// Decompress a group of blocks sequentially with a shared predictor.
+/// Decompress one already-read block and verify it against its trailer.
 ///
-/// Blocks must already be sorted by `block_id` so the predictor state
-/// evolves in the same order as during compression.
-#[cfg(feature = "enterprise")]
-fn decompress_group(
-    blocks: &[RawBlock],
-    predictor: &mut dyn ProbabilityPredictor,
-) -> Result<Vec<(usize, Vec<u8>)>> {
-    let mut results = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let decompressed = router::decompress_chunk(
+/// Takes no predictor: decoding depends on the payload, the method, the
+/// expected size and the dictionary baseline, and nothing else. That is what
+/// makes blocks independently decodable, and therefore parallelisable in any
+/// order.
+#[cfg(feature = "threading")]
+fn decompress_raw_block(block: &RawBlock, dict_baseline: Option<&[u8]>) -> Result<Vec<u8>> {
+    {
+        let decompressed = router::decompress_chunk_with_baseline(
             &block.payload,
             block.compression_method,
             block.uncompressed_size,
-            predictor,
-            !block.predictor_state_flag,
+            dict_baseline,
         )
         .map_err(|e| {
             AetherError::Decompression(format!(
@@ -104,9 +97,75 @@ fn decompress_group(
             });
         }
 
-        results.push((block.global_idx, decompressed));
+        Ok(decompressed)
     }
-    Ok(results)
+}
+
+/// Cross-check a block header against its block-index entry and the format's
+/// size limits.
+///
+/// Both read paths (sequential `decompress_block` and the parallel path's
+/// phase 1) must apply exactly the same checks: an archive that one path
+/// rejects and the other accepts is a security hole. Keeping them in one
+/// function is what makes that inspectable.
+fn validate_block_header(
+    block_header: &BlockHeader,
+    block_entry: &BlockIndexEntry,
+    offset: u64,
+) -> Result<()> {
+    // S5 security fix: cross-check block_id to prevent block misattribution
+    // from crafted archives with inconsistent block index entries.
+    if block_header.block_id != block_entry.block_id {
+        return Err(AetherError::Decompression(format!(
+            "Block ID mismatch: index says {} but header says {} (offset {:#x})",
+            block_entry.block_id, block_header.block_id, offset,
+        )));
+    }
+
+    // Cross-check block header against block index entry to detect
+    // inconsistencies from crafted or corrupted archives.
+    if block_header.uncompressed_size != block_entry.uncompressed_size {
+        return Err(AetherError::Decompression(format!(
+            "Block {}: uncompressed_size mismatch between header ({}) and index ({})",
+            block_header.block_id, block_header.uncompressed_size, block_entry.uncompressed_size,
+        )));
+    }
+
+    // Cross-check solid_group_id between block header and block index
+    // to prevent blocks being assigned to wrong groups (which would
+    // corrupt predictor state and could cause silent data misinterpretation).
+    if block_header.solid_group_id != block_entry.solid_group_id {
+        return Err(AetherError::Decompression(format!(
+            "Block {}: solid_group_id mismatch between header ({}) and index ({})",
+            block_header.block_id, block_header.solid_group_id, block_entry.solid_group_id,
+        )));
+    }
+
+    // Bounds check: reject implausibly large compressed payloads
+    if block_header.compressed_size as usize > MAX_DECOMPRESSED_BLOCK_SIZE {
+        return Err(AetherError::ResourceLimitExceeded(format!(
+            "Block {} (offset {:#x}, group {}): compressed size {} exceeds safety limit of {} bytes",
+            block_header.block_id,
+            offset,
+            block_header.solid_group_id,
+            block_header.compressed_size,
+            MAX_DECOMPRESSED_BLOCK_SIZE,
+        )));
+    }
+
+    // Bounds check: reject implausibly large uncompressed sizes
+    if block_header.uncompressed_size as usize > MAX_DECOMPRESSED_BLOCK_SIZE {
+        return Err(AetherError::ResourceLimitExceeded(format!(
+            "Block {} (offset {:#x}, group {}): uncompressed size {} exceeds safety limit of {} bytes",
+            block_header.block_id,
+            offset,
+            block_header.solid_group_id,
+            block_header.uncompressed_size,
+            MAX_DECOMPRESSED_BLOCK_SIZE,
+        )));
+    }
+
+    Ok(())
 }
 
 /// Seekable methods on `Decompressor`.
@@ -297,20 +356,22 @@ impl Decompressor {
             &self.password,
         )?;
 
-        // Decompress all blocks — parallel when enterprise + multi-threaded
-        #[cfg(feature = "enterprise")]
+        // Decompress all blocks — parallel when `threading` is enabled and
+        // more than one block is in play.
+        #[cfg(feature = "threading")]
         let decompressed_blocks = if self.max_threads != 1 && metadata.block_index.len() > 1 {
             self.decompress_blocks_parallel(archive, &metadata, &decrypt_key)?
         } else {
             self.decompress_blocks_sequential(archive, &metadata, &decrypt_key)?
         };
-        #[cfg(not(feature = "enterprise"))]
+        #[cfg(not(feature = "threading"))]
         let decompressed_blocks =
             self.decompress_blocks_sequential(archive, &metadata, &decrypt_key)?;
 
-        // Reassemble files
+        // Reassemble files, releasing each block as it is consumed.
+        let mut decompressed_blocks = decompressed_blocks;
         for file_entry in &metadata.file_entries {
-            let file_data = reassemble_file_from_blocks(file_entry, &decompressed_blocks)?;
+            let file_data = reassemble_file_consuming(file_entry, &mut decompressed_blocks)?;
 
             // Verify BLAKE3 hash
             let computed_hash = blake3::hash(&file_data);
@@ -376,7 +437,7 @@ impl Decompressor {
                 ))
             })?;
 
-        let mut predictor = self.create_predictor()?;
+        let baseline = self.decode_baseline()?;
 
         // Only allocate for the blocks this file actually needs, not all
         // blocks in the archive. This prevents a crafted archive with
@@ -392,7 +453,7 @@ impl Decompressor {
             let data = self.decompress_block(
                 archive,
                 &metadata.block_index[i],
-                predictor.as_mut(),
+                baseline.as_deref(),
                 &decrypt_key,
             )?;
             total_decompressed += data.len() as u64;
@@ -411,7 +472,7 @@ impl Decompressor {
             chunk_start_idx: 0,
             ..file_entry.clone()
         };
-        let file_data = reassemble_file_from_blocks(&adjusted_entry, &decompressed_blocks)?;
+        let file_data = reassemble_file_consuming(&adjusted_entry, &mut decompressed_blocks)?;
 
         // Verify
         let computed_hash = blake3::hash(&file_data);
@@ -456,30 +517,70 @@ impl Decompressor {
             corrupted_blocks: Vec::new(),
         };
 
-        // Use per-group predictors for correct cross-block state, matching
-        // the streaming verify path. A single predictor shared across groups
-        // would cause state divergence and false verification failures.
-        let mut predictors: std::collections::HashMap<u32, Box<dyn ProbabilityPredictor>> =
-            std::collections::HashMap::new();
+        // Blocks are independently decodable, so verification needs neither a
+        // per-group predictor map nor the cap that used to bound its growth —
+        // only the dictionary baseline, resolved once.
+        let baseline = self.decode_baseline()?;
 
         let mut decompressed_blocks: Vec<Option<Vec<u8>>> = vec![None; metadata.block_index.len()];
 
-        for (i, block_entry) in metadata.block_index.iter().enumerate() {
-            // Limit predictor creation to prevent unbounded HashMap growth
-            if !predictors.contains_key(&block_entry.solid_group_id)
-                && predictors.len() >= MAX_SOLID_GROUP_COUNT as usize
-            {
-                result.corrupted_blocks.push(block_entry.block_id);
-                break;
-            }
-            let predictor = predictors
-                .entry(block_entry.solid_group_id)
-                .or_insert_with(|| {
-                    self.create_predictor()
-                        .unwrap_or_else(|_| (self.predictor_factory)())
-                });
+        // Verification decodes every block, so it scales exactly like
+        // extraction does. Unlike extraction it must not stop at the first
+        // failure — a corrupt block is the thing being looked for — so both
+        // the read and the decode record failures per block and continue.
+        #[cfg(feature = "threading")]
+        let decoded: Vec<Result<Vec<u8>>> = if self.max_threads != 1
+            && metadata.block_index.len() > 1
+        {
+            use rayon::prelude::*;
 
-            match self.decompress_block(archive, block_entry, predictor.as_mut(), &decrypt_key) {
+            let raw = self.read_raw_blocks_lenient(archive, &metadata, &decrypt_key);
+            let baseline = baseline.as_deref();
+            let decode_all = || -> Vec<Result<Vec<u8>>> {
+                raw.par_iter()
+                    .map(|block| match block {
+                        Ok(block) => decompress_raw_block(block, baseline),
+                        Err(e) => Err(AetherError::Decompression(e.clone())),
+                    })
+                    .collect()
+            };
+
+            if self.max_threads == 0 {
+                decode_all()
+            } else {
+                match rayon::ThreadPoolBuilder::new()
+                    .num_threads(self.max_threads)
+                    .build()
+                {
+                    Ok(pool) => pool.install(decode_all),
+                    Err(e) => {
+                        return Err(AetherError::Decompression(format!(
+                            "Failed to create verification thread pool with {} threads: {e}",
+                            self.max_threads,
+                        )))
+                    }
+                }
+            }
+        } else {
+            metadata
+                .block_index
+                .iter()
+                .map(|block_entry| {
+                    self.decompress_block(archive, block_entry, baseline.as_deref(), &decrypt_key)
+                })
+                .collect()
+        };
+        #[cfg(not(feature = "threading"))]
+        let decoded: Vec<Result<Vec<u8>>> = metadata
+            .block_index
+            .iter()
+            .map(|block_entry| {
+                self.decompress_block(archive, block_entry, baseline.as_deref(), &decrypt_key)
+            })
+            .collect();
+
+        for (i, (block_entry, outcome)) in metadata.block_index.iter().zip(decoded).enumerate() {
+            match outcome {
                 Ok(data) => {
                     decompressed_blocks[i] = Some(data);
                     result.verified_blocks += 1;
@@ -523,61 +624,14 @@ impl Decompressor {
         &self,
         archive: &mut R,
         block_entry: &BlockIndexEntry,
-        predictor: &mut dyn ProbabilityPredictor,
+        dict_baseline: Option<&[u8]>,
         decrypt_key: &Option<super::decompress::DecryptKey>,
     ) -> Result<Vec<u8>> {
         let offset = block_entry.archive_offset;
         archive.seek(SeekFrom::Start(offset))?;
 
         let block_header = BlockHeader::read_from_at(archive, offset)?;
-
-        // S5 security fix: cross-check block_id to prevent block misattribution
-        // from crafted archives with inconsistent block index entries.
-        if block_header.block_id != block_entry.block_id {
-            return Err(AetherError::Decompression(format!(
-                "Block ID mismatch: index says {} but header says {} (offset {:#x})",
-                block_entry.block_id, block_header.block_id, offset,
-            )));
-        }
-
-        // Cross-check block header against block index entry to detect
-        // inconsistencies from crafted or corrupted archives.
-        if block_header.uncompressed_size != block_entry.uncompressed_size {
-            return Err(AetherError::Decompression(format!(
-                "Block {}: uncompressed_size mismatch between header ({}) and index ({})",
-                block_header.block_id,
-                block_header.uncompressed_size,
-                block_entry.uncompressed_size,
-            )));
-        }
-
-        // Cross-check solid_group_id between block header and block index
-        // to prevent blocks being assigned to wrong groups (which would
-        // corrupt predictor state and could cause silent data misinterpretation).
-        if block_header.solid_group_id != block_entry.solid_group_id {
-            return Err(AetherError::Decompression(format!(
-                "Block {}: solid_group_id mismatch between header ({}) and index ({})",
-                block_header.block_id, block_header.solid_group_id, block_entry.solid_group_id,
-            )));
-        }
-
-        // Bounds check: reject implausibly large compressed payloads
-        if block_header.compressed_size as usize > MAX_DECOMPRESSED_BLOCK_SIZE {
-            return Err(AetherError::ResourceLimitExceeded(format!(
-                "Block {} (offset {:#x}, group {}): compressed size {} exceeds safety limit of {} bytes",
-                block_header.block_id, offset, block_header.solid_group_id,
-                block_header.compressed_size, MAX_DECOMPRESSED_BLOCK_SIZE,
-            )));
-        }
-
-        // Bounds check: reject implausibly large uncompressed sizes
-        if block_header.uncompressed_size as usize > MAX_DECOMPRESSED_BLOCK_SIZE {
-            return Err(AetherError::ResourceLimitExceeded(format!(
-                "Block {} (offset {:#x}, group {}): uncompressed size {} exceeds safety limit of {} bytes",
-                block_header.block_id, offset, block_header.solid_group_id,
-                block_header.uncompressed_size, MAX_DECOMPRESSED_BLOCK_SIZE,
-            )));
-        }
+        validate_block_header(&block_header, block_entry, offset)?;
 
         // Read compressed (possibly encrypted) payload
         let mut payload = vec![0u8; block_header.compressed_size as usize];
@@ -590,12 +644,11 @@ impl Decompressor {
         let payload = maybe_decrypt_payload(payload, decrypt_key, block_header.block_id)?;
 
         // Decompress
-        let decompressed = router::decompress_chunk(
+        let decompressed = router::decompress_chunk_with_baseline(
             &payload,
             block_header.compression_method,
             block_header.uncompressed_size as usize,
-            predictor,
-            !block_header.predictor_state_flag,
+            dict_baseline,
         )
         .map_err(|e| {
             AetherError::Decompression(format!(
@@ -644,7 +697,7 @@ impl Decompressor {
         decrypt_key: &Option<super::decompress::DecryptKey>,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         let mut decompressed_blocks: Vec<Option<Vec<u8>>> = vec![None; metadata.block_index.len()];
-        let mut predictor = self.create_predictor()?;
+        let baseline = self.decode_baseline()?;
         // S4 security fix: track cumulative decompressed size to prevent
         // decompression bomb attacks (many small blocks → enormous output).
         let mut total_decompressed: u64 = 0;
@@ -660,7 +713,7 @@ impl Decompressor {
                 )));
             }
             let data =
-                self.decompress_block(archive, block_entry, predictor.as_mut(), decrypt_key)?;
+                self.decompress_block(archive, block_entry, baseline.as_deref(), decrypt_key)?;
             total_decompressed += data.len() as u64;
             if total_decompressed > MAX_TOTAL_DECOMPRESSED_SIZE {
                 return Err(AetherError::ResourceLimitExceeded(format!(
@@ -673,23 +726,105 @@ impl Decompressor {
         Ok(decompressed_blocks)
     }
 
-    /// Decompress all blocks in parallel across solid groups (enterprise feature).
+    /// Read every block's payload, recording per-block failures instead of
+    /// stopping at the first one.
     ///
-    /// Two-phase approach that separates I/O from CPU:
+    /// The fail-fast reader inside `decompress_blocks_parallel` is right for
+    /// extraction — a block that will not read means the extraction cannot
+    /// succeed. Verification is the opposite: finding those blocks is the
+    /// point, and a corrupt header must not hide the state of everything
+    /// after it. Reads are positioned from the block index, so one bad block
+    /// does not desynchronise the next.
     ///
-    /// 1. **Sequential I/O**: Read all block payloads from the archive into memory
-    ///    (and decrypt if needed). This must be sequential because the archive is
+    /// Errors are carried as strings because they are re-raised per block on
+    /// the other side of a rayon boundary.
+    #[cfg(feature = "threading")]
+    fn read_raw_blocks_lenient<R: Read + Seek>(
+        &self,
+        archive: &mut R,
+        metadata: &ArchiveMetadata,
+        decrypt_key: &Option<super::decompress::DecryptKey>,
+    ) -> Vec<std::result::Result<RawBlock, String>> {
+        let mut blocks = Vec::with_capacity(metadata.block_index.len());
+
+        for (i, block_entry) in metadata.block_index.iter().enumerate() {
+            blocks.push(
+                self.read_raw_block(archive, i, block_entry, decrypt_key)
+                    .map_err(|e| e.to_string()),
+            );
+        }
+
+        blocks
+    }
+
+    /// Read one block's header, payload and trailer, decrypting if needed.
+    #[cfg(feature = "threading")]
+    fn read_raw_block<R: Read + Seek>(
+        &self,
+        archive: &mut R,
+        global_idx: usize,
+        block_entry: &BlockIndexEntry,
+        decrypt_key: &Option<super::decompress::DecryptKey>,
+    ) -> Result<RawBlock> {
+        let offset = block_entry.archive_offset;
+        archive.seek(SeekFrom::Start(offset))?;
+
+        let block_header = BlockHeader::read_from_at(archive, offset)?;
+        validate_block_header(&block_header, block_entry, offset)?;
+
+        let mut payload = vec![0u8; block_header.compressed_size as usize];
+        archive.read_exact(&mut payload)?;
+
+        let trailer = BlockTrailer::read_from_with_id(archive, block_header.block_id)?;
+        let payload = maybe_decrypt_payload(payload, decrypt_key, block_header.block_id)?;
+
+        Ok(RawBlock {
+            global_idx,
+            payload,
+            compression_method: block_header.compression_method,
+            uncompressed_size: block_header.uncompressed_size as usize,
+            content_blake3: trailer.content_blake3,
+            block_id: block_header.block_id,
+            archive_offset: offset,
+            solid_group_id: block_header.solid_group_id,
+        })
+    }
+
+    /// Decompress all blocks in parallel (requires the `threading` feature).
+    ///
+    /// Two phases:
+    ///
+    /// 1. **Sequential I/O** — read every block payload (and decrypt it, if
+    ///    the archive is encrypted). This must be sequential: the archive is
     ///    a single `Read + Seek` stream.
     ///
-    /// 2. **Parallel CPU**: Group blocks by `solid_group_id`, create one predictor
-    ///    per group, and decompress groups concurrently via rayon. Each group is
-    ///    independent — its predictor state evolves only within that group's blocks
-    ///    (sorted by `block_id`).
+    /// 2. **Parallel CPU** — decode every block concurrently, one rayon task
+    ///    per block so work-stealing absorbs the wide spread in block sizes.
     ///
-    /// Thread pool size is controlled by `Decompressor::max_threads`:
-    /// - `0` = unlimited (global rayon pool, all cores)
-    /// - `N > 1` = bounded thread pool with N threads
-    #[cfg(feature = "enterprise")]
+    /// # Why any partition is valid
+    ///
+    /// Blocks are *independently decodable*. `router::decompress_chunk` uses
+    /// the predictor it is handed only for the dictionary coding baseline;
+    /// every payload is range-decoded by a scratch predictor that
+    /// `decode_block` resets before the first symbol. So a block's output is
+    /// a function of its own payload plus the dictionary — not of any other
+    /// block, and not of the order blocks are processed in. (The router's
+    /// "Group predictor state" note has the full argument, and the parallel
+    /// *compression* path relies on the same property.)
+    ///
+    /// This is why the unit of work is a block rather than a solid group: the
+    /// grouping only ever existed to keep predictor state in sequence, and
+    /// there is no such state. An archive with one large group and several
+    /// tiny ones parallelised no better than sequential under the old
+    /// group-per-task split.
+    ///
+    /// Results are written back by `global_idx`, so the output is identical
+    /// for every thread count. `parallel_and_sequential_extraction_match`
+    /// pins that.
+    ///
+    /// Thread count comes from [`Decompressor::with_max_threads`]:
+    /// `0` = the global rayon pool, `N > 1` = a bounded pool of N.
+    #[cfg(feature = "threading")]
     fn decompress_blocks_parallel<R: Read + Seek>(
         &self,
         archive: &mut R,
@@ -700,68 +835,16 @@ impl Decompressor {
 
         let block_count = metadata.block_index.len();
 
-        // Phase 1: Sequential I/O — read all block payloads from disk
+        // ── Phase 1: sequential I/O ───────────────────────────────────────
         let mut raw_blocks: Vec<RawBlock> =
             Vec::with_capacity(block_count.min(MAX_PREALLOC_CAPACITY));
         // Track cumulative compressed bytes read to prevent OOM from archives
         // with many blocks claiming large compressed_size (matching sequential path).
         let mut total_compressed_read: u64 = 0;
         for (i, block_entry) in metadata.block_index.iter().enumerate() {
-            let offset = block_entry.archive_offset;
-            archive.seek(SeekFrom::Start(offset))?;
+            let block = self.read_raw_block(archive, i, block_entry, decrypt_key)?;
 
-            let block_header = BlockHeader::read_from_at(archive, offset)?;
-
-            // S5 security fix: cross-check block_id
-            if block_header.block_id != block_entry.block_id {
-                return Err(AetherError::Decompression(format!(
-                    "Block ID mismatch: index says {} but header says {} (offset {:#x})",
-                    block_entry.block_id, block_header.block_id, offset,
-                )));
-            }
-
-            // Cross-check block header against block index entry
-            if block_header.uncompressed_size != block_entry.uncompressed_size {
-                return Err(AetherError::Decompression(format!(
-                    "Block {}: uncompressed_size mismatch between header ({}) and index ({})",
-                    block_header.block_id,
-                    block_header.uncompressed_size,
-                    block_entry.uncompressed_size,
-                )));
-            }
-
-            // Cross-check solid_group_id (parallel path)
-            if block_header.solid_group_id != block_entry.solid_group_id {
-                return Err(AetherError::Decompression(format!(
-                    "Block {}: solid_group_id mismatch between header ({}) and index ({})",
-                    block_header.block_id, block_header.solid_group_id, block_entry.solid_group_id,
-                )));
-            }
-
-            // Bounds check: reject implausibly large compressed payloads
-            if block_header.compressed_size as usize > MAX_DECOMPRESSED_BLOCK_SIZE {
-                return Err(AetherError::ResourceLimitExceeded(format!(
-                    "Block {} (offset {:#x}, group {}): compressed size {} exceeds safety limit of {} bytes",
-                    block_header.block_id, offset, block_header.solid_group_id,
-                    block_header.compressed_size, MAX_DECOMPRESSED_BLOCK_SIZE,
-                )));
-            }
-
-            // Bounds check: reject implausibly large uncompressed sizes
-            if block_header.uncompressed_size as usize > MAX_DECOMPRESSED_BLOCK_SIZE {
-                return Err(AetherError::ResourceLimitExceeded(format!(
-                    "Block {} (offset {:#x}, group {}): uncompressed size {} exceeds safety limit of {} bytes",
-                    block_header.block_id, offset, block_header.solid_group_id,
-                    block_header.uncompressed_size, MAX_DECOMPRESSED_BLOCK_SIZE,
-                )));
-            }
-
-            // Read compressed (possibly encrypted) payload
-            let mut payload = vec![0u8; block_header.compressed_size as usize];
-            archive.read_exact(&mut payload)?;
-
-            // Cumulative compressed size tracking (matching sequential path)
-            total_compressed_read += block_header.compressed_size as u64;
+            total_compressed_read += block.payload.len() as u64;
             if total_compressed_read > MAX_TOTAL_COMPRESSED_READ_SIZE {
                 return Err(AetherError::ResourceLimitExceeded(format!(
                     "Total compressed read size {} exceeds safety limit of {} bytes",
@@ -769,23 +852,7 @@ impl Decompressor {
                 )));
             }
 
-            // Read and verify trailer
-            let trailer = BlockTrailer::read_from_with_id(archive, block_header.block_id)?;
-
-            // Decrypt if the archive is encrypted
-            let payload = maybe_decrypt_payload(payload, decrypt_key, block_header.block_id)?;
-
-            raw_blocks.push(RawBlock {
-                global_idx: i,
-                payload,
-                compression_method: block_header.compression_method,
-                uncompressed_size: block_header.uncompressed_size as usize,
-                predictor_state_flag: block_header.predictor_state_flag,
-                content_blake3: trailer.content_blake3,
-                block_id: block_header.block_id,
-                archive_offset: offset,
-                solid_group_id: block_header.solid_group_id,
-            });
+            raw_blocks.push(block);
         }
 
         // S7 security fix: pre-check total expected decompressed size before
@@ -800,48 +867,38 @@ impl Decompressor {
             )));
         }
 
-        // Group blocks by solid_group_id
-        let mut groups: HashMap<u32, Vec<RawBlock>> = HashMap::new();
-        for raw in raw_blocks {
-            groups.entry(raw.solid_group_id).or_default().push(raw);
-        }
+        // ── Phase 2: parallel decode ──────────────────────────────────────
+        //
+        // One task per block, so rayon work-steals: block sizes vary by two
+        // orders of magnitude within one archive, and a fixed partition
+        // leaves workers idle behind whichever lane drew the large blocks.
+        // Per-block granularity is affordable precisely because a task
+        // carries no state — just the shared baseline.
+        let baseline = self.decode_baseline()?;
+        let baseline = baseline.as_deref();
 
-        // Sort blocks within each group by block_id for correct predictor state
-        let mut group_work: Vec<Vec<RawBlock>> = groups.into_values().collect();
-        for blocks in &mut group_work {
-            blocks.sort_by_key(|b| b.block_id);
-        }
-
-        // Create predictors on main thread (factory may not be Send+Sync)
-        let mut work: Vec<(Vec<RawBlock>, Box<dyn ProbabilityPredictor>)> = Vec::new();
-        for blocks in group_work {
-            let predictor = self.create_predictor()?;
-            work.push((blocks, predictor));
-        }
-
-        // Phase 2: Parallel decompression across solid groups
-        #[allow(clippy::type_complexity)]
-        let group_results: Vec<Result<Vec<(usize, Vec<u8>)>>> = if self.max_threads == 0 {
-            // Unlimited: use the global rayon pool (all cores)
-            work.par_iter_mut()
-                .map(|(blocks, predictor)| decompress_group(blocks, predictor.as_mut()))
+        let decode_all = || -> Vec<Result<(usize, Vec<u8>)>> {
+            raw_blocks
+                .par_iter()
+                .map(|block| {
+                    decompress_raw_block(block, baseline).map(|data| (block.global_idx, data))
+                })
                 .collect()
+        };
+
+        let block_results = if self.max_threads == 0 {
+            decode_all()
         } else {
-            // Bounded: create a scoped thread pool with limited threads
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(self.max_threads)
                 .build()
                 .map_err(|e| {
-                    AetherError::Compression(format!(
+                    AetherError::Decompression(format!(
                         "Failed to create decompression thread pool with {} threads: {e}",
                         self.max_threads,
                     ))
                 })?;
-            pool.install(|| {
-                work.par_iter_mut()
-                    .map(|(blocks, predictor)| decompress_group(blocks, predictor.as_mut()))
-                    .collect()
-            })
+            pool.install(decode_all)
         };
 
         // Assemble results into flat array
@@ -849,17 +906,16 @@ impl Decompressor {
         // decompression bomb attacks.
         let mut decompressed_blocks: Vec<Option<Vec<u8>>> = vec![None; block_count];
         let mut total_decompressed: u64 = 0;
-        for result in group_results {
-            for (global_idx, data) in result? {
-                total_decompressed += data.len() as u64;
-                if total_decompressed > MAX_TOTAL_DECOMPRESSED_SIZE {
-                    return Err(AetherError::ResourceLimitExceeded(format!(
-                        "Total decompressed size {} exceeds safety limit of {} bytes",
-                        total_decompressed, MAX_TOTAL_DECOMPRESSED_SIZE,
-                    )));
-                }
-                decompressed_blocks[global_idx] = Some(data);
+        for result in block_results {
+            let (global_idx, data) = result?;
+            total_decompressed += data.len() as u64;
+            if total_decompressed > MAX_TOTAL_DECOMPRESSED_SIZE {
+                return Err(AetherError::ResourceLimitExceeded(format!(
+                    "Total decompressed size {} exceeds safety limit of {} bytes",
+                    total_decompressed, MAX_TOTAL_DECOMPRESSED_SIZE,
+                )));
             }
+            decompressed_blocks[global_idx] = Some(data);
         }
 
         Ok(decompressed_blocks)
