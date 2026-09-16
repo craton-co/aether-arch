@@ -287,6 +287,13 @@ rather than not existing.
 both are shown because the spread between them is the machine, not the code —
 which is exactly why the per-round ratio is the number to read.
 
+A second confirmation session on a busier host reproduced the same shape at
+the low end of the range: `archive/extract_all` 1.98x / 2.21x,
+`archive/verify` 1.12x / 2.82x, `decode/ssm_bwt_stream` 1.76x / 2.41x. Take
+**2-3x** as the honest interval for whole-archive extraction rather than any
+single figure; the 1.12x `verify` round had base and new at 658 ms and 586 ms
+while the very next round had 912 ms and 323 ms, which is the host talking.
+
 | Benchmark | main | branch | speedup |
 |---|---:|---:|---:|
 | `archive/extract_all` | 1128 ms / 799 ms | 376 ms / 307 ms | **3.00x / 2.61x** |

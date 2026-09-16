@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the predictor are fused so a symbol is resolved from ~9 quantised
   boundaries instead of a materialised 257-entry table; and the NeuralSSM
   literal baseline is consumed without building and copying a `[f32; 256]`
-  per byte. Whole-archive extraction and `aet verify` measure **2.6-3.0x**
-  faster single-threaded against 0.3.0, before any thread scaling. Details,
+  per byte. Whole-archive extraction and `aet verify` measure **2-3x** faster
+  single-threaded against 0.3.0 (the spread is the measurement host, not the
+  workload), before any thread scaling. Details,
   per-stage measurements and the rejected alternatives are in
   [`docs/perf/decompression.md`](docs/perf/decompression.md).
 - **Parallel decompression moved from the `enterprise` feature to
